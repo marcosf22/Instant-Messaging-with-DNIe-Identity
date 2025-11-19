@@ -1,87 +1,97 @@
-import socket, time
-
+import socket
+import time
+import threading
 from zeroconf import ServiceInfo, Zeroconf, ServiceBrowser
 
-# Configuración definida en el documento
-SERVICE_TYPE = "_dni-im._udp.local."
-TARGET_PORT = 443  # El endpoint donde recibiremos los datos 
+# --- CONFIGURACIÓN ---
+TYPE = "_dni-im._udp.local."
+MY_PORT = 443
 
-class MyListener:
-    """Clase que maneja los eventos cuando se encuentran otros dispositivos."""
+# Almacén global de pares descubiertos (Diccionario: IP -> Nombre)
+# Usamos un diccionario para evitar duplicados
+discovered_peers = {} 
 
-    def remove_service(self, zeroconf, type, name):
-        print(f"[-] Servicio desconectado: {name}")
-
-    def update_service(self, zeroconf, type, name):
-        pass
-
-    def add_service(self, zeroconf, type, name):
-        """Se llama automáticamente cuando se detecta un nuevo peer."""
-        info = zeroconf.get_service_info(type, name)
+class DiscoveryListener:
+    def add_service(self, zc, type, name):
+        info = zc.get_service_info(type, name)
         if info:
-            # Convertir la dirección de bytes a string legible (ej. 192.168.1.50)
-            address = socket.inet_ntoa(info.addresses[0])
-            print(f"[+] ¡Dispositivo Encontrado!")
-            print(f"    Nombre: {name}")
-            print(f"    IP: {address}")
-            print(f"    Puerto Endpoint: {info.port}")
-            print(f"    ----------------------------------")
+            ip = socket.inet_ntoa(info.addresses[0])
+            # Guardamos al peer en nuestra lista global
+            if ip not in discovered_peers:
+                discovered_peers[ip] = name
+                print(f"\n[+] ¡Nuevo usuario encontrado! {name} ({ip})")
+                print("Presiona Enter para refrescar el menú...")
 
-def get_local_ip():
-    """Obtiene la IP real de la máquina en la LAN (no 127.0.0.1)."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    def remove_service(self, zc, type, name):
+        # Opcional: Limpiar la lista si se van
+        pass
+    def update_service(self, zc, type, name): pass
+
+def start_background_discovery():
+    """Inicia el proceso de escuchar mDNS en segundo plano."""
+    zeroconf = Zeroconf()
+    listener = DiscoveryListener()
+    browser = ServiceBrowser(zeroconf, TYPE, listener)
+    # Retornamos zeroconf para poder cerrarlo al salir
+    return zeroconf
+
+def send_hello(target_ip):
+    """Envía el mensaje 'Hola' al puerto 443 del objetivo."""
+    print(f"[*] Enviando 'Hola' a {target_ip}:443...")
+    
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        # No es necesario que esta IP sea alcanzable realmente
-        s.connect(('10.255.255.255', 1))
-        IP = s.getsockname()[0]
-    except Exception:
-        IP = '127.0.0.1'
+        message = "Hola"
+        # En el proyecto real, aquí cifrarías el mensaje con Noise
+        sock.sendto(message.encode('utf-8'), (target_ip, 443))
+        print("[*] Mensaje enviado correctamente.")
+    except Exception as e:
+        print(f"[!] Error al enviar: {e}")
     finally:
-        s.close()
-    return IP
+        sock.close()
 
 def main():
-    # 1. Obtener nuestra IP local para anunciarla
-    local_ip = get_local_ip()
-    print(f"[*] Mi IP Local es: {local_ip}")
-    print(f"[*] Iniciando mDNS en {SERVICE_TYPE} apuntando al puerto {TARGET_PORT}...")
-
-    # 2. Configurar el ANUNCIO (Advertising)
-    # Preparamos la info que enviaremos a la red: "Aquí estoy, búscame en el puerto 443"
-    my_service_name = f"Usuario-{local_ip.replace('.', '-')}.{SERVICE_TYPE}"
+    print("--- INICIANDO APP P2P ---")
     
-    info = ServiceInfo(
-        SERVICE_TYPE,
-        my_service_name,
-        addresses=[socket.inet_aton(local_ip)],
-        port=TARGET_PORT, # 
-        properties={'version': '0.1', 'type': 'dni-client'},
-    )
-
-    zeroconf = Zeroconf()
+    # 1. Arrancamos el descubrimiento (se queda escuchando en hilos de fondo)
+    zc = start_background_discovery()
     
     try:
-        # Publicamos nuestro servicio
-        zeroconf.register_service(info)
-        print("[*] Servicio registrado exitosamente. Soy visible para otros.")
-
-        # 3. Configurar el DESCUBRIMIENTO (Browsing)
-        # Buscamos a otros que estén anunciando lo mismo
-        listener = MyListener()
-        browser = ServiceBrowser(zeroconf, SERVICE_TYPE, listener)
-        
-        print("[*] Escuchando en la red (Presiona Ctrl+C para salir)...\n")
-        
-        # Mantenemos el script corriendo
         while True:
-            time.sleep(1)
+            # Mostramos el menú principal
+            print("\n--- USUARIOS DISPONIBLES ---")
             
+            # Convertimos el diccionario a una lista indexada para facilitar la selección
+            peer_list = list(discovered_peers.items()) # [(ip, name), ...]
+            
+            if not peer_list:
+                print(" (Buscando usuarios en la red...)")
+            else:
+                for idx, (ip, name) in enumerate(peer_list):
+                    print(f" [{idx}] {name} - IP: {ip}")
+
+            print("\n[R]efrescar lista | [S]alir | Escribe el número ID para saludar:")
+            selection = input(">> ")
+
+            if selection.lower() == 's':
+                break
+            elif selection.lower() == 'r':
+                continue # Simplemente vuelve a pintar la lista
+            elif selection.isdigit():
+                idx = int(selection)
+                if 0 <= idx < len(peer_list):
+                    target_ip = peer_list[idx][0] # Sacamos la IP de la tupla
+                    send_hello(target_ip)
+                    input("Presiona Enter para continuar...")
+                else:
+                    print("[!] Selección inválida.")
+            else:
+                pass
+
     except KeyboardInterrupt:
-        print("\n[*] Deteniendo servicio...")
+        print("\nSaliendo...")
     finally:
-        # Al cerrar, nos des-registramos limpiamente
-        zeroconf.unregister_service(info)
-        zeroconf.close()
+        zc.close()
 
 if __name__ == '__main__':
     main()
