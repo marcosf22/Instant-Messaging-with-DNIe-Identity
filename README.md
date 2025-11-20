@@ -1,4 +1,9 @@
 # Instant-Messaging-with-DNIe-Identity
 
-pip install zeroconfig
-pip install noiseprotocol
+```bash
+    pip install zeroconfig
+```
+```bash
+    pip install noiseprotocol
+```
+
