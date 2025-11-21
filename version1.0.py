@@ -8,18 +8,25 @@ import sys
 import getpass
 import time
 from smartcard.System import readers
+
+# Librerías criptográficas auxiliares
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, x25519
 from cryptography.hazmat.primitives import serialization
+
+# Zeroconf para descubrimiento (mDNS)
 from zeroconf import ServiceInfo
 from zeroconf.asyncio import AsyncServiceBrowser, AsyncZeroconf
+
+# --- AQUÍ ESTÁ LA LIBRERÍA NOISE (OBLIGATORIA) ---
 from noise.connection import NoiseConnection, Keypair
 
 # --- CONFIGURACIÓN ---
-SERVICE_TYPE = "_dni-im._udp.local."
-MY_PORT = 443
+SERVICE_TYPE = "_dni-im._udp.local." # [cite: 7]
+MY_PORT = 443                        # [cite: 7, 11]
+# Protocolo Noise IK requerido por el enunciado 
 NOISE_PROTOCOL = b'Noise_IK_25519_ChaChaPoly_BLAKE2s'
 
 # AJUSTA ESTA RUTA A TU INSTALACIÓN DE OPENSC
@@ -40,7 +47,7 @@ except ImportError:
     sys.exit(1)
 
 # ==============================================================================
-#  GESTIÓN HARDWARE (DNIe)
+#  GESTIÓN HARDWARE (DNIe) [cite: 6, 63]
 # ==============================================================================
 def cargar_driver():
     pkcs11 = PyKCS11.PyKCS11Lib()
@@ -52,19 +59,13 @@ def cargar_driver():
     return pkcs11
 
 def iniciar_sesion_bloqueante(pkcs11_lib):
-    """Espera lector y tarjeta. Usa PIN cacheado o pide uno nuevo."""
     global CACHED_PIN
-    
-    # 1. Esperar Lector
     while True:
         l = readers()
-        if l: 
-            # print(f"\r[DNIe] Lector: {l[0]}", end='')
-            break
+        if l: break
         print("[DNIe] Conecta el lector...", end='\r')
         time.sleep(1)
 
-    # 2. Esperar Tarjeta
     slot = None
     while True:
         try:
@@ -76,31 +77,24 @@ def iniciar_sesion_bloqueante(pkcs11_lib):
         print("[DNIe] Inserta la tarjeta...", end='\r')
         time.sleep(1)
 
-    # 3. Abrir Sesión
     session = pkcs11_lib.openSession(slot)
-    
-    # 4. Login (Reusar PIN si existe)
     try:
         if not CACHED_PIN:
             CACHED_PIN = getpass.getpass("\n[PIN] Introduce el PIN del DNIe: ")
         session.login(CACHED_PIN)
         return session
     except Exception as e:
-        print(f"\n[!] Error de Login (PIN incorrecto?): {e}")
-        CACHED_PIN = None # Resetear PIN si falló
+        print(f"\n[!] Error de Login: {e}")
+        CACHED_PIN = None
         raise e
 
 def extraer_certificado():
-    """Carga certificado del DNIe y lo guarda en variable global."""
     global MI_CERT_DER
-    
-    # Si ya tenemos el archivo, cargarlo rápido
     if os.path.exists("certificado.der"):
         print("[init] Cargando 'certificado.der' del disco...")
         with open("certificado.der", "rb") as f:
             MI_CERT_DER = f.read()
-            
-        # [NUEVO] Forzar verificación de PIN aunque tengamos el certificado
+        # Verificar PIN aunque esté cacheado para asegurar presencia 
         print("[init] Verificando titularidad (PIN)...")
         lib = cargar_driver()
         try:
@@ -108,13 +102,10 @@ def extraer_certificado():
             session.logout()
             session.closeSession()
         except Exception as e:
-            print(f"Error de autenticación: {e}")
-            sys.exit(1)
-            
+            print(f"Error: {e}"); sys.exit(1)
         return
 
-    # Si no, leerlo del DNIe
-    print("[init] Leyendo certificado del DNIe (esto tarda un poco)...")
+    print("[init] Leyendo certificado del DNIe...")
     lib = cargar_driver()
     try:
         session = iniciar_sesion_bloqueante(lib)
@@ -123,23 +114,17 @@ def extraer_certificado():
             (PyKCS11.CKA_CERTIFICATE_TYPE, PyKCS11.CKC_X_509)
         ])
         if not objs: raise Exception("No hay certificados")
-
         MI_CERT_DER = bytes(objs[0].to_dict()['CKA_VALUE'])
-
         session.logout()
         session.closeSession()
     except Exception as e:
-        print(f"Error extrayendo certificado: {e}")
-        sys.exit(1)
+        print(f"Error: {e}"); sys.exit(1)
 
 def firmar_bloqueante(data):
-    """Firma datos usando el hardware. Se ejecuta en un hilo aparte."""
     lib = cargar_driver()
     session = None
     try:
         session = iniciar_sesion_bloqueante(lib)
-        
-        # Buscar clave privada de firma
         keys = session.findObjects([(PyKCS11.CKA_CLASS, PyKCS11.CKO_PRIVATE_KEY)])
         target_key = keys[0]
         for k in keys:
@@ -147,20 +132,17 @@ def firmar_bloqueante(data):
                 label = session.getAttributeValue(k, [PyKCS11.CKA_LABEL])[0]
                 if "Firma" in label: target_key = k; break
             except: pass
-            
+        
         mech = PyKCS11.Mechanism(PyKCS11.CKM_SHA256_RSA_PKCS, None)
         sig = bytes(session.sign(target_key, data, mech))
-        
         session.logout()
         return sig
     except Exception as e:
-        print(f"\n[!] Error firmando: {e}")
-        return None
+        print(f"\n[!] Error firmando: {e}"); return None
     finally:
         if session: session.closeSession()
 
 async def firmar_async(data):
-    """Wrapper para no bloquear el bucle de eventos principal."""
     loop = asyncio.get_running_loop()
     print("\n[DNIe] Firmando handshake...", end='', flush=True)
     sig = await loop.run_in_executor(None, firmar_bloqueante, data)
@@ -171,7 +153,6 @@ def verificar(cert_bytes, firma, datos):
     try:
         cert = x509.load_der_x509_certificate(cert_bytes, default_backend())
         cert.public_key().verify(firma, datos, padding.PKCS1v15(), hashes.SHA256())
-        
         cn = "Desconocido"
         for attr in cert.subject:
             if attr.oid == x509.NameOID.COMMON_NAME: cn = attr.value
@@ -180,9 +161,10 @@ def verificar(cert_bytes, firma, datos):
         return False, None
 
 # ==============================================================================
-#  LÓGICA DE SESIÓN (NOISE)
+#  LÓGICA DE SESIÓN (NOISE) - CORREGIDA
 # ==============================================================================
 def generar_claves_noise():
+    # Generamos claves compatibles con Curve25519 (usadas por Noise)
     priv = x25519.X25519PrivateKey.generate()
     priv_b = priv.private_bytes(encoding=serialization.Encoding.Raw, format=serialization.PrivateFormat.Raw, encryption_algorithm=serialization.NoEncryption())
     pub_b = priv.public_key().public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
@@ -190,25 +172,51 @@ def generar_claves_noise():
 
 class SecureSession:
     def __init__(self, priv, remote_pub=None):
+        # 1. INICIALIZAMOS LA LIBRERÍA NOISE [cite: 8]
         self.proto = NoiseConnection.from_name(NOISE_PROTOCOL)
+        
+        # 2. CARGAMOS NUESTRA CLAVE PRIVADA EN NOISE
         self.proto.set_keypair_from_private_bytes(Keypair.STATIC, priv)
-        if remote_pub: self.proto.set_keypair_from_public_bytes(Keypair.REMOTE_STATIC, remote_pub)
+        
+        if remote_pub: 
+            self.proto.set_keypair_from_public_bytes(Keypair.REMOTE_STATIC, remote_pub)
+        
+        # Guardamos nuestra clave PÚBLICA (calculada desde la privada 'priv')
+        # para poder firmarla con el DNIe y enviarla en el payload.
+        # ESTA ES LA CORRECCIÓN: No intentamos leerla de self.proto._handshake...
+        # porque esa variable es privada/inaccesible de esa forma.
+        tmp_priv = x25519.X25519PrivateKey.from_private_bytes(priv)
+        self.my_static_public = tmp_priv.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw, 
+            format=serialization.PublicFormat.Raw
+        )
+
         self.handshake_done = False
         self.cipher_tx = None
         self.cipher_rx = None
-        self.local_cid = os.urandom(4)
+        self.local_cid = os.urandom(4) # Connection ID [cite: 11]
         self.remote_cid = None
 
     async def _build_payload(self):
-        mi_static = self.proto.handshake_state.s.public_bytes
-        firma = await firmar_async(mi_static) # ASÍNCRONO
+        # Usamos nuestra clave pública estática para firmarla
+        mi_static = self.my_static_public
+        
+        # Firma de la clave pública estática con DNIe [cite: 65]
+        firma = await firmar_async(mi_static) 
         if not firma: raise Exception("Fallo Firma")
+        
+        # Payload: CID + Longitud Cert + Certificado + Firma
         return self.local_cid + struct.pack('!H', len(MI_CERT_DER)) + MI_CERT_DER + firma
 
     async def start_handshake(self):
+        # Usamos métodos nativos de Noise para iniciar
         self.proto.set_as_initiator()
         self.proto.start_handshake()
+        
+        # Creamos el payload firmado
         pl = await self._build_payload()
+        
+        # Noise escribe el mensaje inicial + nuestro payload
         return self.proto.write_message(pl)
 
     async def process_packet(self, data):
@@ -218,15 +226,22 @@ class SecureSession:
             self.proto.start_handshake()
 
         try:
+            # Noise procesa el mensaje entrante
             full = self.proto.read_message(data)
-            if len(full) < 8: raise Exception("Payload corto")
             
+            # Decodificamos el payload recibido (CID, Cert, Firma)
+            if len(full) < 8: raise Exception("Payload corto")
             self.remote_cid = full[:4]
             l_c = struct.unpack('!H', full[4:6])[0]
             cert_rem = full[6 : 6+l_c]
             firma_rem = full[6+l_c :]
             
-            rem_static = self.proto.handshake_state.rs.public_bytes
+            # Obtenemos la clave pública remota que Noise ha extraído del handshake
+            # NOTA: Aquí SÍ podemos usar rs (remote static) si el handshake avanzó,
+            # pero es más seguro confiar en la que noise ya ha validado criptográficamente.
+            rem_static = self.proto.noise_protocol.handshake_state.rs.public_bytes
+            
+            # Verificar identidad del peer [cite: 65]
             ok, name = verificar(cert_rem, firma_rem, rem_static)
             if not ok: raise Exception("Firma Inválida")
             
@@ -245,6 +260,7 @@ class SecureSession:
             return None
 
     def encrypt(self, msg):
+        # Cifrado post-handshake con ChaCha20-Poly1305 (manejado por Noise) [cite: 8]
         return self.remote_cid + self.cipher_tx.encrypt(msg.encode())
 
     def decrypt(self, data):
@@ -270,7 +286,7 @@ class SessionManager:
     def find_addr(self, addr): return self.s_addr.get(addr)
 
 # ==============================================================================
-#  RED Y MAIN
+#  RED Y MAIN [cite: 66]
 # ==============================================================================
 class DNIeTransport(asyncio.DatagramProtocol):
     def __init__(self, mgr): self.mgr = mgr; self.transport = None
@@ -281,7 +297,7 @@ class DNIeTransport(asyncio.DatagramProtocol):
 
     async def _handle(self, data, addr):
         if len(data) < 4: return
-        cid = data[:4]
+        cid = data[:4] # [cite: 11]
         sess = self.mgr.find_cid(cid)
 
         if sess and sess.handshake_done:
@@ -305,6 +321,7 @@ class DiscoveryListener:
         asyncio.create_task(self._proc(zc, type, name))
     async def _proc(self, zc, type, name):
         info = await zc.async_get_service_info(type, name)
+        # Descubrimiento via mDNS [cite: 7]
         if info and info.properties.get(b'pk'):
             self.peers[name] = {'ip': socket.inet_ntoa(info.addresses[0]), 'pk': binascii.unhexlify(info.properties[b'pk'])}
             print(f"\n[+] Usuario: {name}\n>> ", end='', flush=True)
@@ -313,14 +330,10 @@ class DiscoveryListener:
 
 async def main():
     print("--- INICIANDO SISTEMA DNIe ---")
-    
-    # 1. Cargar Certificado (Bloqueante, pero necesario al inicio)
     extraer_certificado()
-    
-    # 2. Generar Claves
     my_priv, my_pub = generar_claves_noise()
     
-    # 3. IP
+    # Determinar IP Local
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try: s.connect(('8.8.8.8', 1)); my_ip = s.getsockname()[0]
     except: my_ip = '127.0.0.1'
@@ -328,17 +341,18 @@ async def main():
     
     my_name = f"User-{my_ip.replace('.', '-')}.{SERVICE_TYPE}"
     
-    # 4. Iniciar Red
     mgr = SessionManager(my_priv)
     peers = {}
     loop = asyncio.get_running_loop()
     
+    # Puerto UDP 443 [cite: 7]
     try:
         tr, pr = await loop.create_datagram_endpoint(lambda: DNIeTransport(mgr), local_addr=('0.0.0.0', MY_PORT))
     except PermissionError:
         print("[!] EJECUTA COMO ADMIN (Puerto 443)"); return
 
     aiozc = AsyncZeroconf()
+    # Publicar servicio mDNS [cite: 7]
     info = ServiceInfo(SERVICE_TYPE, my_name, addresses=[socket.inet_aton(my_ip)], port=MY_PORT, properties={b'pk': binascii.hexlify(my_pub), b'version': '1.0'})
     await aiozc.async_register_service(info)
     AsyncServiceBrowser(aiozc.zeroconf, SERVICE_TYPE, listener=DiscoveryListener(my_name, peers))
@@ -358,13 +372,14 @@ async def main():
                 if not peers: print(" No hay peers disponibles.")
             elif act == "conectar":
                 if len(parts)<2: continue
+                # Se busca la clave pública del peer (anunciada en mDNS)
                 pk = next((p['pk'] for p in peers.values() if p['ip'] == parts[1]), None)
                 if pk:
                     print("Firmando handshake...")
                     sess = mgr.get_initiator((parts[1], MY_PORT), pk)
-                    pkt = await sess.start_handshake()
+                    pkt = await sess.start_handshake() # Inicia handshake Noise IK [cite: 8]
                     tr.sendto(pkt, (parts[1], MY_PORT))
-                else: print("Peer desconocido")
+                else: print("Peer desconocido (espera a que aparezca en mDNS)")
             elif act == "msg":
                 if len(parts)<3: continue
                 sess = next((s for s in mgr.s_cid.values() if mgr.s_addr.get((parts[1], MY_PORT)) == s), None)
