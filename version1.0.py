@@ -7,6 +7,7 @@ import os
 import sys
 import getpass
 import time
+import traceback
 from smartcard.System import readers
 
 # Librerías criptográficas auxiliares
@@ -125,18 +126,18 @@ def firmar_bloqueante(data):
     session = None
     try:
         session = iniciar_sesion_bloqueante(lib)
-        keys = session.findObjects([(PyKCS11.CKA_CLASS, PyKCS11.CKO_PRIVATE_KEY)])
-        target_key = keys[0]
-        for k in keys:
-            try:
-                label = session.getAttributeValue(k, [PyKCS11.CKA_LABEL])[0]
-                if "Firma" in label: target_key = k; break
-            except: pass
+        # Buscamos la clave privada de FIRMA en el DNIe.
+        claves_privadas = session.findObjects([(PyKCS11.CKA_CLASS, PyKCS11.CKO_PRIVATE_KEY)])    
+        for clave in claves_privadas:
+            label = session.getAttributeValue(clave, [PyKCS11.CKA_LABEL])[0]
+            if label == "KprivFirmaDigital":
+                clave_privada = clave
+                break
         
-        mech = PyKCS11.Mechanism(PyKCS11.CKM_SHA256_RSA_PKCS, None)
-        sig = bytes(session.sign(target_key, data, mech))
+        mechanism = PyKCS11.Mechanism(PyKCS11.CKM_SHA256_RSA_PKCS, None)
+        firma_raw = bytes(session.sign(clave_privada, data, mechanism))
         session.logout()
-        return sig
+        return firma_raw
     except Exception as e:
         print(f"\n[!] Error firmando: {e}"); return None
     finally:
@@ -204,7 +205,8 @@ class SecureSession:
         # Firma de la clave pública estática con DNIe [cite: 65]
         firma = await firmar_async(mi_static) 
         if not firma: raise Exception("Fallo Firma")
-        
+        print(f"[DEBUG] Firma generada ({len(firma)} bytes)")
+        print(f"[DEBUG] Certificado ({len(MI_CERT_DER)} bytes)")
         # Payload: CID + Longitud Cert + Certificado + Firma
         return self.local_cid + struct.pack('!H', len(MI_CERT_DER)) + MI_CERT_DER + firma
 
@@ -221,20 +223,24 @@ class SecureSession:
 
     async def process_packet(self, data):
         if self.handshake_done: return None
-        if not self.proto.handshake_started:
+        if not self.proto._handshake_started:
             self.proto.set_as_responder()
             self.proto.start_handshake()
 
         try:
             # Noise procesa el mensaje entrante
             full = self.proto.read_message(data)
-            
+            print(f"[DEBUG] Payload recibido ({len(full)} bytes)")
             # Decodificamos el payload recibido (CID, Cert, Firma)
             if len(full) < 8: raise Exception("Payload corto")
             self.remote_cid = full[:4]
+            print(f"[DEBUG] Remote CID: {binascii.hexlify(self.remote_cid).decode()}")
             l_c = struct.unpack('!H', full[4:6])[0]
+            print(f"[DEBUG] Longitud Cert: {l_c}")
             cert_rem = full[6 : 6+l_c]
+            print(f"[DEBUG] Cert: {cert_rem}")
             firma_rem = full[6+l_c :]
+            print(f"[DEBUG] Firma: {binascii.hexlify(firma_rem).decode()}")
             
             # Obtenemos la clave pública remota que Noise ha extraído del handshake
             # NOTA: Aquí SÍ podemos usar rs (remote static) si el handshake avanzó,
@@ -256,6 +262,7 @@ class SecureSession:
             return self.proto.write_message(resp)
 
         except Exception as e:
+            traceback.print_exc()
             logger.error(f"Error HS: {e}")
             return None
 
