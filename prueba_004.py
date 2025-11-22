@@ -1,126 +1,134 @@
 import socket
 import logging
-from typing import Callable, Optional
+import asyncio
 from zeroconf import Zeroconf, ServiceInfo, ServiceBrowser, ServiceStateChange
 
-# Configuración definida en el documento
-SERVICE_TYPE = "_dni-im._udp.local."
-CHAT_PORT = 443  # [cite: 7, 11] El tráfico real va por el 443, aunque mDNS usa 5353
+# Configuración del documento
+SERVICE_TYPE = "_dni-im._udp.local." # [cite: 7]
+CHAT_PORT = 443                       # [cite: 7]
 
-# Configurar logging básico para ver qué pasa
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Discovery")
 
-def get_local_ip():
-    """Obtiene la IP local de la interfaz que sale a internet/LAN."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        # No se envía nada, solo se usa para determinar la ruta
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-    except Exception:
-        ip = "127.0.0.1"
-    finally:
-        s.close()
-    return ip
-
-class DiscoveryListener:
-    """Clase callback que maneja los eventos de encontrar/perder peers."""
-    
-    def __init__(self, on_peer_update: Callable):
-        self.on_peer_update = on_peer_update
-
-    def remove_service(self, zeroconf, type, name):
-        logger.info(f"Peer desconectado: {name}")
-        # Notificamos con data=None para indicar borrado
-        self.on_peer_update(name, None)
-
-    def add_service(self, zeroconf, type, name):
-        logger.info(f"Peer encontrado: {name}")
-        # Intentamos resolver la info completa (IP, Puerto, TXT records)
-        info = zeroconf.get_service_info(type, name)
-        if info:
-            self.on_peer_update(name, info)
-
-    def update_service(self, zeroconf, type, name):
-        # Para simplificar, tratamos la actualización como un 'add'
-        self.add_service(zeroconf, type, name)
-
-class DiscoveryService:
-    def __init__(self, display_name: str, on_peer_found_callback: Callable):
+class DiscoveryManager:
+    def __init__(self, display_name, contacts_callback):
+        """
+        display_name: Tu nombre (ej. "Alex").
+        contacts_callback: Función que se ejecuta al encontrar/perder a alguien.
+                           Debe aceptar (action, name, info).
+        """
         self.zeroconf = Zeroconf()
         self.display_name = display_name
-        self.local_ip = get_local_ip()
-        self.callback = on_peer_found_callback
+        self.callback = contacts_callback
         self.browser = None
         self.info = None
+        self.running = False
 
-    def start_advertising(self):
+    def _get_local_ip(self):
+        """Truco para obtener la IP real de la LAN."""
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+        except Exception:
+            ip = "127.0.0.1"
+        finally:
+            s.close()
+        return ip
+
+    def on_service_state_change(self, zeroconf, service_type, name, state_change):
         """
-        Anuncia nuestra presencia en la red (mDNS Advertising).
-        Punta al puerto 443 donde escuchará nuestro servidor UDP.
+        Este método se ejecuta AUTOMÁTICAMENTE en segundo plano
+        cada vez que hay movimiento en la red.
         """
-        # El nombre debe ser único en la red: "Nombre._dni-im._udp.local."
-        service_name = f"{self.display_name}.{SERVICE_TYPE}"
+        if state_change is ServiceStateChange.Added or state_change is ServiceStateChange.Updated:
+            # Alguien ha aparecido o se ha actualizado
+            info = zeroconf.get_service_info(service_type, name)
+            if info:
+                # Llamamos al callback de forma thread-safe para asyncio
+                self.callback("ADD", name, info)
         
-        # Aquí construimos el paquete que explicamos antes
+        elif state_change is ServiceStateChange.Removed:
+            # Alguien se ha ido
+            self.callback("REMOVE", name, None)
+
+    async def start(self):
+        """Inicia el anuncio y la escucha de forma constante."""
+        self.running = True
+        local_ip = self._get_local_ip()
+
+        # 1. PREPARAR EL ANUNCIO (Advertising)
+        # Esto se queda activo hasta que llamemos a close()
         self.info = ServiceInfo(
             type_=SERVICE_TYPE,
-            name=service_name,
-            addresses=[socket.inet_aton(self.local_ip)], # IP en bytes
-            port=CHAT_PORT,                              # Puerto 443 
+            name=f"{self.display_name}.{SERVICE_TYPE}",
+            addresses=[socket.inet_aton(local_ip)],
+            port=CHAT_PORT,  # [cite: 7] Anunciamos puerto 443
             properties={
-                # Aquí pondremos el fingerprint del DNIe más adelante 
-                b'version': b'0.1', 
-                b'display_name': self.display_name.encode('utf-8')
+                b'name': self.display_name.encode()
+                # Aquí meteremos el DNIe fingerprint luego
             },
             server=f"{self.display_name}.local."
         )
-
-        logger.info(f"Anunciando presencia: {service_name} en {self.local_ip}:{CHAT_PORT}")
+        
+        logger.info(f"[*] Anunciando {self.display_name} en {local_ip}:{CHAT_PORT}")
         self.zeroconf.register_service(self.info)
 
-    def start_browsing(self):
-        """
-        Empieza a buscar otros peers en la red (mDNS Browsing).
-        """
-        logger.info(f"Buscando peers en {SERVICE_TYPE}...")
-        listener = DiscoveryListener(self.callback)
-        self.browser = ServiceBrowser(self.zeroconf, SERVICE_TYPE, listener)
+        # 2. INICIAR LA ESCUCHA (Browsing)
+        # ServiceBrowser crea sus propios hilos y se queda "vivo" buscando.
+        logger.info("[*] Escuchando tráfico mDNS...")
+        self.browser = ServiceBrowser(
+            self.zeroconf, 
+            SERVICE_TYPE, 
+            handlers=[self.on_service_state_change]
+        )
 
-    def stop(self):
-        """Limpia los recursos al cerrar el programa."""
-        if self.info:
-            self.zeroconf.unregister_service(self.info)
+        # No necesitamos un bucle aquí, zeroconf ya corre en background.
+        # Solo devolvemos el control para que asyncio siga con otras cosas (TUI/Chat).
+
+    async def stop(self):
+        """Detiene todo limpiamente."""
+        logger.info("Deteniendo Discovery...")
+        self.running = False
         if self.browser:
             self.browser.cancel()
+        if self.info:
+            self.zeroconf.unregister_service(self.info)
         self.zeroconf.close()
 
-# --- BLOQUE DE PRUEBA (Para ejecutar este archivo solo) ---
+# --- CÓDIGO DE PRUEBA (Simulación del bucle principal) ---
 if __name__ == "__main__":
-    import time
+    # Configurar logs
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-    # Función simple para imprimir cuando encontramos a alguien
-    def print_peer(name, info):
-        if info:
-            # Convertir dirección IP de bytes a string
-            address = socket.inet_ntoa(info.addresses[0])
-            print(f"\n[+] NUEVO CONTACTO: {name}")
-            print(f"    IP: {address} | Puerto: {info.port}")
-            print(f"    Datos extra (TXT): {info.properties}")
-        else:
-            print(f"\n[-] CONTACTO PERDIDO: {name}")
+    # Esta función simula lo que hará tu Interfaz (TUI) cuando llegue un contacto
+    def update_contacts_ui(action, name, info):
+        if action == "ADD":
+            addr = socket.inet_ntoa(info.addresses[0])
+            print(f"\n>>> TUI UPDATE: Nuevo usuario detectado: {name} ({addr}:{info.port})")
+        elif action == "REMOVE":
+            print(f"\n>>> TUI UPDATE: Usuario desconectado: {name}")
 
-    # Simular usuario "UsuarioPrueba"
-    disco = DiscoveryService("UsuarioPrueba", print_peer)
-    
-    try:
-        disco.start_advertising()
-        disco.start_browsing()
+    async def main():
+        # Instanciamos el gestor
+        discovery = DiscoveryManager("MiUsuario", update_contacts_ui)
         
-        print("Presiona Ctrl+C para salir...")
-        while True:
-            time.sleep(1)
+        # Arrancamos (esto no bloquea, solo inicia los servicios)
+        await discovery.start()
+
+        print("--- SISTEMA CORRIENDO (Ctrl+C para salir) ---")
+        print("--- Tu nodo está visible y buscando peers constantemente ---")
+        
+        # Mantenemos el programa vivo para simular que la app está abierta
+        try:
+            while True:
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await discovery.stop()
+
+    # Ejecutar con asyncio
+    try:
+        asyncio.run(main())
     except KeyboardInterrupt:
-        print("Cerrando...")
-        disco.stop()
+        pass
