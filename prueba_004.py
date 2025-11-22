@@ -1,30 +1,25 @@
 import socket
 import logging
 import asyncio
-from zeroconf import Zeroconf, ServiceInfo, ServiceBrowser, ServiceStateChange
+from zeroconf import ServiceStateChange
+from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZeroconf
 
 # Configuración del documento
-SERVICE_TYPE = "_dni-im._udp.local." # [cite: 7]
-CHAT_PORT = 443                       # [cite: 7]
+SERVICE_TYPE = "_dni-im._udp.local."
+CHAT_PORT = 443
 
 logger = logging.getLogger("Discovery")
 
 class DiscoveryManager:
     def __init__(self, display_name, contacts_callback):
-        """
-        display_name: Tu nombre (ej. "Alex").
-        contacts_callback: Función que se ejecuta al encontrar/perder a alguien.
-                           Debe aceptar (action, name, info).
-        """
-        self.zeroconf = Zeroconf()
+        self.aio_zeroconf = None # Se inicializa en start()
         self.display_name = display_name
         self.callback = contacts_callback
         self.browser = None
         self.info = None
-        self.running = False
 
     def _get_local_ip(self):
-        """Truco para obtener la IP real de la LAN."""
+        """Obtiene la IP local de la interfaz principal."""
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             s.connect(("8.8.8.8", 80))
@@ -37,89 +32,84 @@ class DiscoveryManager:
 
     def on_service_state_change(self, zeroconf, service_type, name, state_change):
         """
-        Este método se ejecuta AUTOMÁTICAMENTE en segundo plano
-        cada vez que hay movimiento en la red.
+        Callback que se ejecuta cuando hay cambios en la red.
+        Nota: En la versión Async, esto a veces se ejecuta en el hilo del loop,
+        pero para estar seguros, procesamos la info con cuidado.
         """
+        asyncio.ensure_future(self._process_service_change(zeroconf, service_type, name, state_change))
+
+    async def _process_service_change(self, zeroconf, service_type, name, state_change):
         if state_change is ServiceStateChange.Added or state_change is ServiceStateChange.Updated:
-            # Alguien ha aparecido o se ha actualizado
-            info = zeroconf.get_service_info(service_type, name)
+            # En la versión async, obtenemos la info de forma asíncrona
+            info = await zeroconf.get_service_info(service_type, name)
             if info:
-                # Llamamos al callback de forma thread-safe para asyncio
                 self.callback("ADD", name, info)
         
         elif state_change is ServiceStateChange.Removed:
-            # Alguien se ha ido
             self.callback("REMOVE", name, None)
 
     async def start(self):
-        """Inicia el anuncio y la escucha de forma constante."""
-        self.running = True
+        """Inicia el anuncio y la escucha usando AsyncZeroconf."""
         local_ip = self._get_local_ip()
+        
+        # 1. Inicializar AsyncZeroconf
+        self.aio_zeroconf = AsyncZeroconf()
 
-        # 1. PREPARAR EL ANUNCIO (Advertising)
-        # Esto se queda activo hasta que llamemos a close()
-        self.info = ServiceInfo(
+        # 2. PREPARAR EL ANUNCIO (Advertising)
+        # Usamos AsyncServiceInfo en lugar de ServiceInfo
+        self.info = AsyncServiceInfo(
             type_=SERVICE_TYPE,
             name=f"{self.display_name}.{SERVICE_TYPE}",
             addresses=[socket.inet_aton(local_ip)],
-            port=CHAT_PORT,  # [cite: 7] Anunciamos puerto 443
+            port=CHAT_PORT,
             properties={
                 b'name': self.display_name.encode()
-                # Aquí meteremos el DNIe fingerprint luego
             },
             server=f"{self.display_name}.local."
         )
         
         logger.info(f"[*] Anunciando {self.display_name} en {local_ip}:{CHAT_PORT}")
-        self.zeroconf.register_service(self.info)
+        # Aquí está la clave: await register_service
+        await self.aio_zeroconf.register_service(self.info)
 
-        # 2. INICIAR LA ESCUCHA (Browsing)
-        # ServiceBrowser crea sus propios hilos y se queda "vivo" buscando.
+        # 3. INICIAR LA ESCUCHA (Browsing)
         logger.info("[*] Escuchando tráfico mDNS...")
-        self.browser = ServiceBrowser(
-            self.zeroconf, 
+        self.browser = AsyncServiceBrowser(
+            self.aio_zeroconf.zeroconf, 
             SERVICE_TYPE, 
             handlers=[self.on_service_state_change]
         )
 
-        # No necesitamos un bucle aquí, zeroconf ya corre en background.
-        # Solo devolvemos el control para que asyncio siga con otras cosas (TUI/Chat).
-
     async def stop(self):
         """Detiene todo limpiamente."""
         logger.info("Deteniendo Discovery...")
-        self.running = False
         if self.browser:
             self.browser.cancel()
-        if self.info:
-            self.zeroconf.unregister_service(self.info)
-        self.zeroconf.close()
+        if self.info and self.aio_zeroconf:
+            await self.aio_zeroconf.unregister_service(self.info)
+        if self.aio_zeroconf:
+            await self.aio_zeroconf.close()
 
-# --- CÓDIGO DE PRUEBA (Simulación del bucle principal) ---
+# --- CÓDIGO DE PRUEBA ---
 if __name__ == "__main__":
-    # Configurar logs
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-    # Esta función simula lo que hará tu Interfaz (TUI) cuando llegue un contacto
     def update_contacts_ui(action, name, info):
         if action == "ADD":
-            addr = socket.inet_ntoa(info.addresses[0])
-            print(f"\n>>> TUI UPDATE: Nuevo usuario detectado: {name} ({addr}:{info.port})")
+            # Convertir bytes a IP
+            if info.addresses:
+                addr = socket.inet_ntoa(info.addresses[0])
+                print(f">>> NUEVO USUARIO: {name} ({addr}:{info.port})")
         elif action == "REMOVE":
-            print(f"\n>>> TUI UPDATE: Usuario desconectado: {name}")
+            print(f">>> USUARIO DESCONECTADO: {name}")
 
     async def main():
-        # Instanciamos el gestor
-        discovery = DiscoveryManager("MiUsuario", update_contacts_ui)
+        discovery = DiscoveryManager("Marcos", update_contacts_ui)
         
-        # Arrancamos (esto no bloquea, solo inicia los servicios)
-        await discovery.start()
-
-        print("--- SISTEMA CORRIENDO (Ctrl+C para salir) ---")
-        print("--- Tu nodo está visible y buscando peers constantemente ---")
-        
-        # Mantenemos el programa vivo para simular que la app está abierta
         try:
+            await discovery.start()
+            print("--- CORRIENDO (Ctrl+C para salir) ---")
+            # Bucle infinito para mantener vivo el script
             while True:
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
@@ -127,7 +117,6 @@ if __name__ == "__main__":
         finally:
             await discovery.stop()
 
-    # Ejecutar con asyncio
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
