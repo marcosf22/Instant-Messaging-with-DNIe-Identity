@@ -9,169 +9,176 @@ import time
 import datetime
 import traceback
 
-# --- LIBRERÍAS CRIPTOGRÁFICAS ---
+# --- LIBRERÍAS ---
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, x25519, rsa
 from cryptography.hazmat.primitives import serialization
 from cryptography.x509.oid import NameOID
-
-# --- LIBRERÍA NOISE ---
 from noise.connection import NoiseConnection, Keypair
 
 # ==============================================================================
-#  CONFIGURACIÓN DEL MODO DE USO
+#  CONFIGURACIÓN
 # ==============================================================================
-# [!!!] CAMBIA ESTO A 'True' PARA PROBAR SIN DNIe FÍSICO
-MODO_SIMULACION = True 
+# [!!!] CAMBIA ESTO SEGÚN EL PC:
+# True  = Estás en casa SIN lector (Genera identidad falsa)
+# False = Tienes el DNIe conectado (Busca certificado real)
+MODO_SIMULACION = False
 
 NOISE_PROTOCOL = b'Noise_XX_25519_ChaChaPoly_BLAKE2s'
 MY_PORT = 55555 
 LIB_PATH = r"C:\Program Files\OpenSC Project\OpenSC\pkcs11\opensc-pkcs11.dll"
 
-# Variables Globales
+# Globales
 MI_CERT_DER = None
 MI_KEY_ID = None   
 CACHED_PIN = None
-MOCK_PRIVATE_KEY = None # Se usará solo en modo simulación
+MOCK_PRIVATE_KEY = None 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("DNIe-Client")
 
-# Importación condicional de PyKCS11 (Para que no falle si no tienes la librería en casa)
 if not MODO_SIMULACION:
     try:
         import PyKCS11
         from smartcard.System import readers
     except ImportError:
-        print("ERROR: Instala PyKCS11 (pip install PyKCS11) o activa MODO_SIMULACION")
+        print("ERROR: Instala PyKCS11 (pip install PyKCS11) o pon MODO_SIMULACION=True")
         sys.exit(1)
 
 # ==============================================================================
-#  1. GENERADOR DE IDENTIDAD FALSA (SOLO PARA SIMULACIÓN)
+#  1. GESTIÓN DE IDENTIDAD (SIMULADA)
 # ==============================================================================
 def generar_identidad_simulada():
-    """Genera un par de claves RSA y un certificado X.509 autofirmado al vuelo."""
-    print("[SIM] Generando claves RSA falsas y certificado de prueba...")
-    
-    # 1. Generar clave privada RSA (Simulando la del chip del DNIe)
+    print("[SIM] Generando identidad temporal en RAM...")
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
-    
-    # 2. Crear un certificado autofirmado
     subject = issuer = x509.Name([
         x509.NameAttribute(NameOID.COUNTRY_NAME, u"ES"),
-        x509.NameAttribute(NameOID.COMMON_NAME, u"USUARIO SIMULADO SIN DNI"),
+        x509.NameAttribute(NameOID.COMMON_NAME, u"USUARIO SIMULADO"),
     ])
-    
-    cert = x509.CertificateBuilder().subject_name(
-        subject
-    ).issuer_name(
-        issuer
-    ).public_key(
+    cert = x509.CertificateBuilder().subject_name(subject).issuer_name(issuer).public_key(
         key.public_key()
-    ).serial_number(
-        x509.random_serial_number()
-    ).not_valid_before(
+    ).serial_number(x509.random_serial_number()).not_valid_before(
         datetime.datetime.utcnow()
     ).not_valid_after(
         datetime.datetime.utcnow() + datetime.timedelta(days=1)
     ).add_extension(
         x509.BasicConstraints(ca=True, path_length=None), critical=True,
     ).sign(key, hashes.SHA256(), default_backend())
-    
-    cert_der = cert.public_bytes(serialization.Encoding.DER)
-    
-    return cert_der, key
+    return cert.public_bytes(serialization.Encoding.DER), key
 
 # ==============================================================================
-#  2. GESTIÓN DE IDENTIDAD (Abstracta: Real o Simulada)
+#  2. GESTIÓN DE IDENTIDAD (REAL - CON ANTI-BLOQUEO)
 # ==============================================================================
 def extraer_certificado():
-    """Carga el certificado. Si es simulación lo genera, si es real lee el chip."""
     global MI_CERT_DER, MI_KEY_ID, MOCK_PRIVATE_KEY
     
     if MODO_SIMULACION:
         MI_CERT_DER, MOCK_PRIVATE_KEY = generar_identidad_simulada()
-        print("[SIM] Identidad cargada en memoria RAM.")
         return
 
-    # --- LÓGICA REAL (DNIe) ---
-    print("[init] Leyendo DNIe REAL...")
+    print("[init] Analizando DNIe (Búsqueda de par correcto)...")
     pkcs11 = PyKCS11.PyKCS11Lib()
     try: pkcs11.load(LIB_PATH)
     except: print(f"Error DLL {LIB_PATH}"); sys.exit(1)
 
-    # Esperar lector
     while True:
         try: 
             if readers(): break
         except: pass
         print("[DNIe] Esperando lector...", end='\r'); time.sleep(1)
 
-    # Slot y Login
-    slot = pkcs11.getSlotList(tokenPresent=True)[0]
+    try:
+        slot = pkcs11.getSlotList(tokenPresent=True)[0]
+    except:
+        print("\n[!] No se detecta tarjeta."); sys.exit(1)
+
     session = pkcs11.openSession(slot)
-    
-    global CACHED_PIN
-    if not CACHED_PIN: CACHED_PIN = getpass.getpass("\n[PIN] DNIe: ")
-    try: session.login(CACHED_PIN)
-    except: CACHED_PIN=None; raise Exception("PIN Incorrecto")
+    try:
+        global CACHED_PIN
+        if not CACHED_PIN: CACHED_PIN = getpass.getpass("\n[PIN] DNIe: ")
+        session.login(CACHED_PIN)
 
-    # Buscar Certificado Firma
-    objs = session.findObjects([(PyKCS11.CKA_CLASS, PyKCS11.CKO_CERTIFICATE), (PyKCS11.CKA_CERTIFICATE_TYPE, PyKCS11.CKC_X_509)])
-    target = None
-    for o in objs:
-        lbl = o.to_dict().get('CKA_LABEL', b'').decode('utf-8', errors='ignore')
-        if "Firma" in lbl or "Sign" in lbl: target = o; break
-    if not target: target = objs[0]
+        # --- BÚSQUEDA INTELIGENTE (PROBAR TODOS) ---
+        objs = session.findObjects([(PyKCS11.CKA_CLASS, PyKCS11.CKO_CERTIFICATE), (PyKCS11.CKA_CERTIFICATE_TYPE, PyKCS11.CKC_X_509)])
+        
+        pareja_encontrada = False
+        test_data = b"TEST_INIT"
+        
+        print(f"[init] Probando {len(objs)} certificados internos...")
+        
+        for i, cert_obj in enumerate(objs):
+            try:
+                # Extraer datos
+                attrs = session.getAttributeValue(cert_obj, [PyKCS11.CKA_VALUE, PyKCS11.CKA_ID])
+                c_der = bytes(attrs[0])
+                c_id = attrs[1]
+                
+                # Buscar clave privada hermana
+                keys = session.findObjects([(PyKCS11.CKA_CLASS, PyKCS11.CKO_PRIVATE_KEY), (PyKCS11.CKA_ID, c_id)])
+                if not keys: continue
+                
+                # Prueba de firma
+                mech = PyKCS11.Mechanism(PyKCS11.CKM_SHA256_RSA_PKCS, None)
+                sig = bytes(session.sign(keys[0], test_data, mech))
+                
+                # Prueba de verificación
+                if verificar(c_der, sig, test_data)[0]:
+                    print(f"  -> Certificado #{i}: FUNCIONA. Seleccionado.")
+                    MI_CERT_DER = c_der
+                    MI_KEY_ID = c_id
+                    pareja_encontrada = True
+                    
+                    # Guardar en disco
+                    with open("certificado.der", "wb") as f: f.write(MI_CERT_DER)
+                    break
+            except: continue
+            
+        if not pareja_encontrada:
+            print("\n[!] ERROR: Ningún certificado de la tarjeta funciona para firmar.")
+            sys.exit(1)
 
-    attrs = session.getAttributeValue(target, [PyKCS11.CKA_VALUE, PyKCS11.CKA_ID])
-    MI_CERT_DER = bytes(attrs[0])
-    MI_KEY_ID = attrs[1]
-    
-    print(f"[DNIe] ID Clave Real: {bytes(MI_KEY_ID).hex()}")
-    session.logout(); session.closeSession()
+    except Exception as e:
+        print(f"\n[!] Error init: {e}"); CACHED_PIN=None; sys.exit(1)
+    finally:
+        # ESTO ES CRUCIAL: Liberar la tarjeta para que no se bloquee después
+        try: session.logout(); session.closeSession()
+        except: pass
 
 def firmar_bloqueante(data):
-    """Firma los datos. Si es simulación usa la clave en RAM, si es real usa el chip."""
-    
-    # --- CAMINO SIMULADO ---
     if MODO_SIMULACION:
-        # Usamos la clave RSA generada por software
-        signature = MOCK_PRIVATE_KEY.sign(
-            data,
-            padding.PKCS1v15(),
-            hashes.SHA256()
-        )
-        return signature
+        return MOCK_PRIVATE_KEY.sign(data, padding.PKCS1v15(), hashes.SHA256())
 
-    # --- CAMINO REAL ---
+    # MODO REAL
     pkcs11 = PyKCS11.PyKCS11Lib()
     pkcs11.load(LIB_PATH)
-    
-    # Login rápido (asumiendo lector conectado)
+    session = None
     try:
         slot = pkcs11.getSlotList(tokenPresent=True)[0]
         session = pkcs11.openSession(slot)
         session.login(CACHED_PIN)
         
         keys = session.findObjects([(PyKCS11.CKA_CLASS, PyKCS11.CKO_PRIVATE_KEY), (PyKCS11.CKA_ID, MI_KEY_ID)])
-        if not keys: raise Exception("Clave privada no encontrada")
+        if not keys: raise Exception("Clave no encontrada (¿Sacaste el DNI?)")
         
         mech = PyKCS11.Mechanism(PyKCS11.CKM_SHA256_RSA_PKCS, None)
         sig = bytes(session.sign(keys[0], data, mech))
-        session.logout(); session.closeSession()
         return sig
     except Exception as e:
         print(f"[!] Error firma hardware: {e}"); return None
+    finally:
+        # SIEMPRE CERRAR SESIÓN
+        if session: 
+            try: session.logout(); session.closeSession()
+            except: pass
 
 async def firmar_async(data):
     loop = asyncio.get_running_loop()
-    modo = "SIMULADO" if MODO_SIMULACION else "HARDWARE"
+    modo = "SIM" if MODO_SIMULACION else "DNIe"
     print(f"\n[{modo}] Firmando...", end='', flush=True)
     sig = await loop.run_in_executor(None, firmar_bloqueante, data)
-    print(" OK.")
+    print(" OK.", end=' ', flush=True)
     return sig
 
 def verificar(cert_bytes, firma, datos):
@@ -185,13 +192,12 @@ def verificar(cert_bytes, firma, datos):
     except: return False, None
 
 # ==============================================================================
-#  3. PROTOCOLO DE RED Y NOISE (IGUAL QUE ANTES)
+#  3. NOISE
 # ==============================================================================
 class SecureSession:
     def __init__(self, priv):
         self.proto = NoiseConnection.from_name(NOISE_PROTOCOL)
         self.proto.set_keypair_from_private_bytes(Keypair.STATIC, priv)
-        
         tmp_priv = x25519.X25519PrivateKey.from_private_bytes(priv)
         self.my_static_public = tmp_priv.public_key().public_bytes(
             encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
@@ -217,7 +223,7 @@ class SecureSession:
         
         ok, name = verificar(cert_rem, firma_rem, rem_static)
         if not ok: raise Exception("FIRMA INVÁLIDA")
-        logger.info(f"Identidad Verificada: {name}")
+        logger.info(f"Verificado: {name}")
         return True
 
     async def start_handshake(self):
@@ -246,7 +252,7 @@ class SecureSession:
                  payload_tx = await self._build_payload()
             return self.proto.write_message(payload_tx)
         except Exception as e:
-            if "InvalidTag" in str(e): logger.error("Desincronización (InvalidTag).")
+            if "InvalidTag" in str(e): logger.error("Error Sync (InvalidTag).")
             else: logger.error(f"Error HS: {e}")
             return None
 
@@ -258,13 +264,11 @@ class SecureSession:
 
 class SessionManager:
     def __init__(self, priv):
-        self.priv = priv
-        self.s_cid = {}   
-        self.s_addr = {}  
+        self.priv = priv; self.s_cid = {}; self.s_addr = {}
 
     def reset_session(self, addr):
         if addr in self.s_addr:
-            print(f"[!] Reset sesión {addr[0]}")
+            print(f"[!] Limpiando sesión vieja con {addr[0]}")
             old = self.s_addr[addr]
             if old.local_cid in self.s_cid: del self.s_cid[old.local_cid]
             del self.s_addr[addr]
@@ -286,47 +290,41 @@ class SessionManager:
 
 class DNIeTransport(asyncio.DatagramProtocol):
     def __init__(self, mgr): self.mgr = mgr; self.transport = None
-    def connection_made(self, tr): self.transport = tr; print(f"[✓] Escuchando UDP {MY_PORT}")
+    def connection_made(self, tr): self.transport = tr; print(f"[✓] UDP Escuchando en {MY_PORT}")
     
     def datagram_received(self, data, addr):
-        print(f"[RED] Recibido {len(data)} bytes de {addr[0]}")
+        print(f"[RED] RX {len(data)} bytes <- {addr[0]}")
         asyncio.create_task(self._handle(data, addr))
 
     async def _handle(self, data, addr):
         if len(data) < 4: return 
-        
-        # DETECCIÓN DE RESET (32 bytes = Handshake Init)
-        if len(data) == 32:
-            self.mgr.reset_session(addr)
+        if len(data) == 32: self.mgr.reset_session(addr)
 
         sess = self.mgr.find_cid(data[:4])
         if sess and sess.handshake_done:
-            try:
-                print(f"\n[MSG] {addr[0]}: {sess.decrypt(data[4:])}\n>> ", end='', flush=True)
+            try: print(f"\n[MSG] {addr[0]}: {sess.decrypt(data[4:])}\n>> ", end='', flush=True)
             except: pass
         else:
             sess = self.mgr.find_addr(addr)
             if not sess: sess = self.mgr.get_responder(addr)
-            
             res = await sess.process_packet(data)
-            if isinstance(res, bytes): self.transport.sendto(res, addr)
+            if isinstance(res, bytes): 
+                print(f"[RED] TX {len(res)} bytes -> {addr[0]}")
+                self.transport.sendto(res, addr)
             elif res is True: print(f"\n[★] CONEXIÓN OK: {addr[0]}\n>> ", end='', flush=True)
 
 async def main():
-    modo_txt = "SIMULADO (Sin tarjeta)" if MODO_SIMULACION else "REAL (Con DNIe)"
-    print(f"--- CHAT DNIe: MODO {modo_txt} ---")
+    modo_txt = "SIMULADO" if MODO_SIMULACION else "REAL"
+    print(f"--- CHAT DNIe v6.0: {modo_txt} ---")
     
     extraer_certificado()
     
-    # Self Test
-    test_data = b"TEST"
-    firma = firmar_bloqueante(test_data)
-    if verificar(MI_CERT_DER, firma, test_data)[0]:
-        print("✅ Autocomprobación: OK")
-    else:
-        print("❌ Autocomprobación: FALLO. Certificado/Clave no coinciden."); return
+    # Self Test Rápido
+    print("[init] Autocomprobación...", end='')
+    td = b"T"; f = firmar_bloqueante(td)
+    if verificar(MI_CERT_DER, f, td)[0]: print(" OK")
+    else: print(" FALLO"); return
 
-    # Noise Keys
     priv = x25519.X25519PrivateKey.generate()
     priv_b = priv.private_bytes(encoding=serialization.Encoding.Raw, format=serialization.PrivateFormat.Raw, encryption_algorithm=serialization.NoEncryption())
     
@@ -335,8 +333,7 @@ async def main():
     
     try:
         tr, pr = await loop.create_datagram_endpoint(lambda: DNIeTransport(mgr), local_addr=('0.0.0.0', MY_PORT))
-    except Exception as e:
-        print(f"Error puerto: {e}"); return
+    except Exception as e: print(f"Error puerto: {e}"); return
 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try: s.connect(('8.8.8.8', 1)); my_ip = s.getsockname()[0]
@@ -355,13 +352,15 @@ async def main():
 
             if act == "conectar" and len(parts) >= 2:
                 mgr.reset_session((parts[1], MY_PORT))
-                print(f"Conectando a {parts[1]}...")
+                print(f"Iniciando Handshake con {parts[1]}...")
                 sess = mgr.get_initiator((parts[1], MY_PORT))
                 try:
                     pkt = await sess.start_handshake()
+                    # --- AQUI ES DONDE SE TE QUEDABA PENSANDO ---
+                    print(f"[RED] Enviando paquete inicial ({len(pkt)} bytes)...") 
                     tr.sendto(pkt, (parts[1], MY_PORT))
+                    # Si ves este mensaje y no pasa nada más, ES EL FIREWALL.
                 except Exception as e: print(f"Error: {e}")
-                
             elif act == "msg" and len(parts) >= 3:
                 sess = mgr.find_addr((parts[1], MY_PORT))
                 if sess and sess.handshake_done:
