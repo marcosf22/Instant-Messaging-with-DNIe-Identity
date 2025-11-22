@@ -14,16 +14,50 @@ from protocol import ChatProtocol, MSG_HELLO, MSG_DATA
 PORT = 8888 
 
 def get_lan_ip():
-    """Obtiene la IP real de la red local (WiFi/Ethernet)."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # 1. Detectar sistema y buscar el programa zerotier-cli
+    sistema = platform.system()
+    zt_binary = "zerotier-cli" # Default Linux/Mac
+    
+    if sistema == "Windows":
+        # Rutas comunes en Windows
+        rutas_posibles = [
+            r"C:\Program Files (x86)\ZeroTier\One\zerotier-cli.bat",
+            r"C:\Program Files\ZeroTier\One\zerotier-cli.bat"
+        ]
+        zt_binary = None
+        for ruta in rutas_posibles:
+            if os.path.exists(ruta):
+                zt_binary = ruta
+                break
+        
+        if not zt_binary:
+            print("\n[ERROR] No se encontró ZeroTier en las rutas estándar.")
+            return
+
+    # 2. Ejecutar comando para pedir la info
     try:
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-    except:
-        ip = "127.0.0.1"
-    finally:
-        s.close()
-    return ip
+        # Usamos -j para obtener JSON limpio
+        resultado = subprocess.check_output([zt_binary, "-j", "listnetworks"], text=True)
+        datos = json.loads(resultado)
+    except Exception as e:
+        print(f"\n[ERROR] No se pudo ejecutar ZeroTier: {e}")
+        print("Intenta ejecutar este script como Administrador (o con sudo).")
+        return
+
+    # 3. Filtrar y mostrar solo lo importante
+    redes_encontradas = 0
+    
+    for red in datos:
+        nombre_red = red.get('name', 'Sin Nombre')
+        net_id = red.get('nwid')
+        estado = red.get('status')
+        ips = red.get('assignedAddresses')
+
+        if estado == 'OK' and ips:
+            redes_encontradas += 1
+            # Limpiamos la IP (quitamos la máscara /24, etc)
+            ip_limpia = ips[0].split('/')[0]
+    return ip_limpia
 
 class ChatClient:
     def __init__(self, name):
