@@ -51,24 +51,36 @@ class ChatClient:
         if self.transport:
             self.transport.close()
 
+    # Sustituye este método en main.py
     def on_peer_update(self, action, name, info):
-        """Callback que salta cuando discovery encuentra a alguien."""
-        if action == "ADD" and info:
-            # Extraer IP y Puerto
-            import socket
-            ip = socket.inet_ntoa(info.addresses[0])
-            port = info.port
-            
-            # Evitamos hablarnos a nosotros mismos (comprobando IP local)
-            # En producción usaríamos UUID, aquí simplificamos.
-            if name.startswith(self.display_name):
-                return
+        print(f"DEBUG: Discovery ha visto algo -> Acción: {action}, Nombre: {name}") # <--- NUEVO
 
-            logger.info(f"Peer encontrado: {name} en {ip}:{port}")
-            
-            # Si no tenemos sesión con él, iniciamos Handshake
-            if ip not in self.sessions:
-                self.initiate_handshake(ip, port)
+        if action == "ADD" and info:
+            import socket
+            try:
+                # Intentar sacar la IP
+                if not info.addresses:
+                    print("DEBUG: Detectado usuario sin dirección IP (info.addresses vacío)")
+                    return
+                    
+                ip = socket.inet_ntoa(info.addresses[0])
+                port = info.port
+                print(f"DEBUG: Analizando {name} en {ip}:{port}") # <--- NUEVO
+                
+                # Chequeo de nombre
+                if name.startswith(self.display_name):
+                    print(f"DEBUG: IGNORANDO a {name} porque se llama igual que yo ({self.display_name})") # <--- NUEVO
+                    return
+
+                logger.info(f"Peer encontrado: {name} en {ip}:{port}")
+                
+                if ip not in self.sessions:
+                    print(f"DEBUG: Iniciando Handshake con {ip}...") # <--- NUEVO
+                    self.initiate_handshake(ip, port)
+                else:
+                    print("DEBUG: Ya tengo sesión con este usuario.")
+            except Exception as e:
+                print(f"ERROR CRÍTICO EN DISCOVERY: {e}")
 
         elif action == "REMOVE":
             logger.info(f"Peer desconectado: {name}")
