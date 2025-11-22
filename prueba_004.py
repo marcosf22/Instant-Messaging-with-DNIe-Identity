@@ -12,7 +12,7 @@ logger = logging.getLogger("Discovery")
 
 class DiscoveryManager:
     def __init__(self, display_name, contacts_callback):
-        self.aio_zeroconf = None # Se inicializa en start()
+        self.aio_zeroconf = None 
         self.display_name = display_name
         self.callback = contacts_callback
         self.browser = None
@@ -31,19 +31,17 @@ class DiscoveryManager:
         return ip
 
     def on_service_state_change(self, zeroconf, service_type, name, state_change):
-        """
-        Callback que se ejecuta cuando hay cambios en la red.
-        Nota: En la versión Async, esto a veces se ejecuta en el hilo del loop,
-        pero para estar seguros, procesamos la info con cuidado.
-        """
+        """Callback para cambios en la red."""
         asyncio.ensure_future(self._process_service_change(zeroconf, service_type, name, state_change))
 
     async def _process_service_change(self, zeroconf, service_type, name, state_change):
         if state_change is ServiceStateChange.Added or state_change is ServiceStateChange.Updated:
-            # En la versión async, obtenemos la info de forma asíncrona
-            info = await zeroconf.get_service_info(service_type, name)
-            if info:
-                self.callback("ADD", name, info)
+            # CORRECCIÓN: Usamos self.aio_zeroconf.async_get_service_info
+            # en lugar de zeroconf.get_service_info
+            if self.aio_zeroconf:
+                info = await self.aio_zeroconf.async_get_service_info(service_type, name)
+                if info:
+                    self.callback("ADD", name, info)
         
         elif state_change is ServiceStateChange.Removed:
             self.callback("REMOVE", name, None)
@@ -56,7 +54,6 @@ class DiscoveryManager:
         self.aio_zeroconf = AsyncZeroconf()
 
         # 2. PREPARAR EL ANUNCIO (Advertising)
-        # Usamos AsyncServiceInfo en lugar de ServiceInfo
         self.info = AsyncServiceInfo(
             type_=SERVICE_TYPE,
             name=f"{self.display_name}.{SERVICE_TYPE}",
@@ -69,8 +66,8 @@ class DiscoveryManager:
         )
         
         logger.info(f"[*] Anunciando {self.display_name} en {local_ip}:{CHAT_PORT}")
-        # Aquí está la clave: await register_service
-        await self.aio_zeroconf.register_service(self.info)
+        
+        await self.aio_zeroconf.async_register_service(self.info)
 
         # 3. INICIAR LA ESCUCHA (Browsing)
         logger.info("[*] Escuchando tráfico mDNS...")
@@ -85,10 +82,12 @@ class DiscoveryManager:
         logger.info("Deteniendo Discovery...")
         if self.browser:
             self.browser.cancel()
+        
         if self.info and self.aio_zeroconf:
-            await self.aio_zeroconf.unregister_service(self.info)
+            await self.aio_zeroconf.async_unregister_service(self.info)
+        
         if self.aio_zeroconf:
-            await self.aio_zeroconf.close()
+            await self.aio_zeroconf.async_close()
 
 # --- CÓDIGO DE PRUEBA ---
 if __name__ == "__main__":
@@ -96,7 +95,6 @@ if __name__ == "__main__":
 
     def update_contacts_ui(action, name, info):
         if action == "ADD":
-            # Convertir bytes a IP
             if info.addresses:
                 addr = socket.inet_ntoa(info.addresses[0])
                 print(f">>> NUEVO USUARIO: {name} ({addr}:{info.port})")
@@ -109,7 +107,6 @@ if __name__ == "__main__":
         try:
             await discovery.start()
             print("--- CORRIENDO (Ctrl+C para salir) ---")
-            # Bucle infinito para mantener vivo el script
             while True:
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
