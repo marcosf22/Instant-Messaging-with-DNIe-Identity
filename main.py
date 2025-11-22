@@ -1,11 +1,15 @@
 import asyncio
+import json
+import os
+import platform
+import subprocess
 import sys
 import socket
 import threading
 import queue
-import traceback # Importante para ver el error real
+import traceback
 
-# Tus módulos
+# Tus módulos (asegúrate de que están en la misma carpeta)
 from discovery import DiscoveryManager
 from crypto import KeyManager, SessionCrypto
 from protocol import ChatProtocol, MSG_HELLO, MSG_DATA
@@ -13,64 +17,57 @@ from protocol import ChatProtocol, MSG_HELLO, MSG_DATA
 # Configuración
 PORT = 8888 
 
-def get_lan_ip():
-    # 1. Detectar sistema y buscar el programa zerotier-cli
+def get_zerotier_ip():
+    """Obtiene la IP real preguntando al cliente de ZeroTier"""
     sistema = platform.system()
-    zt_binary = "zerotier-cli" # Default Linux/Mac
+    zt_binary = "zerotier-cli" 
     
     if sistema == "Windows":
-        # Rutas comunes en Windows
-        rutas_posibles = [
+        rutas = [
             r"C:\Program Files (x86)\ZeroTier\One\zerotier-cli.bat",
             r"C:\Program Files\ZeroTier\One\zerotier-cli.bat"
         ]
-        zt_binary = None
-        for ruta in rutas_posibles:
-            if os.path.exists(ruta):
-                zt_binary = ruta
-                break
-        
+        zt_binary = next((r for r in rutas if os.path.exists(r)), None)
         if not zt_binary:
-            print("\n[ERROR] No se encontró ZeroTier en las rutas estándar.")
-            return
+            print("❌ ERROR: No encuentro ZeroTier instalado.")
+            return None
 
-    # 2. Ejecutar comando para pedir la info
     try:
-        # Usamos -j para obtener JSON limpio
-        resultado = subprocess.check_output([zt_binary, "-j", "listnetworks"], text=True)
-        datos = json.loads(resultado)
+        # Ejecutamos zerotier-cli para obtener la IP exacta de la VPN
+        res = subprocess.check_output([zt_binary, "-j", "listnetworks"], text=True)
+        datos = json.loads(res)
+        for red in datos:
+            if red['status'] == 'OK' and red['assignedAddresses']:
+                # Retorna la primera IP de ZeroTier que encuentre (sin la máscara /24)
+                return red['assignedAddresses'][0].split('/')[0]
     except Exception as e:
-        print(f"\n[ERROR] No se pudo ejecutar ZeroTier: {e}")
-        print("Intenta ejecutar este script como Administrador (o con sudo).")
-        return
-
-    # 3. Filtrar y mostrar solo lo importante
-    redes_encontradas = 0
+        print(f"❌ Error leyendo ZeroTier: {e}")
     
-    for red in datos:
-        nombre_red = red.get('name', 'Sin Nombre')
-        net_id = red.get('nwid')
-        estado = red.get('status')
-        ips = red.get('assignedAddresses')
-
-        if estado == 'OK' and ips:
-            redes_encontradas += 1
-            # Limpiamos la IP (quitamos la máscara /24, etc)
-            ip_limpia = ips[0].split('/')[0]
-    return ip_limpia
+    return None
 
 class ChatClient:
     def __init__(self, name):
         self.name = name
         self.loop = asyncio.get_running_loop()
-        self.my_ip = get_lan_ip()
         
-        print("--> Cargando identidad y DNIe...")
+        # 1. OBTENER IP DE ZEROTIER
+        self.my_ip = get_zerotier_ip()
+        if not self.my_ip:
+            print("⚠️ NO SE DETECTÓ ZEROTIER. Usando IP local normal...")
+            self.my_ip = socket.gethostbyname(socket.gethostname())
+        
+        # Calculamos el prefijo de la red (ej: si mi IP es 10.144.20.5 -> prefijo "10.144.")
+        # Esto sirve para filtrar las IPs de los demás y coger solo la del túnel.
+        self.network_prefix = ".".join(self.my_ip.split('.')[:2]) + "."
+
+        print(f"--> Identidad: {name}")
+        print(f"--> Tu IP Túnel (ZeroTier): {self.my_ip}")
+        print(f"--> Filtro de seguridad: Solo aceptaré IPs que empiecen por '{self.network_prefix}'")
+
         try:
             self.key_manager = KeyManager(f"{name}_identity")
         except Exception as e:
-            print(f"\n❌ ERROR CRÍTICO CARGANDO DNIe/CRIPTOGRAFÍA: {e}")
-            print("Revisa la ruta de la DLL en crypto.py")
+            print(f"❌ ERROR CRIPTO: {e}")
             sys.exit(1)
 
         self.sessions = {}        
@@ -79,38 +76,57 @@ class ChatClient:
         self.target_ip = None     
         
         self.protocol = ChatProtocol(self.on_packet)
+        # Pasamos my_ip al discovery por si acaso la librería lo permite usar
         self.discovery = DiscoveryManager(name, self.on_discovery)
         self.transport = None
 
     async def start(self):
-        print(f"--- INICIANDO EN {self.my_ip}:{PORT} ---")
+        print(f"--- INICIANDO ESCUCHA EN {self.my_ip}:{PORT} ---")
         
-        # BIND A LA IP ESPECÍFICA
         try:
+            # Nos atamos EXCLUSIVAMENTE a la IP de ZeroTier
             self.transport, _ = await self.loop.create_datagram_endpoint(
                 lambda: self.protocol, local_addr=(self.my_ip, PORT)
             )
         except Exception as e:
-            print(f"Error crítico puerto {PORT}: {e}")
+            print(f"Error crítico al abrir puerto: {e}")
             return
 
-        print("--- Buscando usuarios... ---")
+        print("--- Buscando usuarios en el túnel... ---")
         await self.discovery.start()
 
     def on_discovery(self, action, name, info):
         if action == "ADD" and info and info.addresses:
-            ip = socket.inet_ntoa(info.addresses[0])
             if name == self.name: return
+
+            # --- CORRECCIÓN CRÍTICA ---
+            # No cogemos la primera IP (info.addresses[0]), buscamos la correcta.
+            found_zt_ip = None
+            
+            # Iteramos todas las IPs que anuncia el otro usuario
+            for addr_bytes in info.addresses:
+                ip_str = socket.inet_ntoa(addr_bytes)
+                
+                # Solo aceptamos la IP si coincide con nuestro prefijo de ZeroTier
+                if ip_str.startswith(self.network_prefix):
+                    found_zt_ip = ip_str
+                    break
+            
+            # Si no encontramos una IP de ZeroTier en su anuncio, la ignoramos (es ruido de WiFi)
+            if not found_zt_ip:
+                # Opcional: debug para ver qué estamos descartando
+                # print(f"Ignorando usuario {name} (solo tiene IPs locales: {[socket.inet_ntoa(a) for a in info.addresses]})")
+                return
 
             # Chequear duplicados
             for p in self.peers.values():
-                if p['ip'] == ip: return
+                if p['ip'] == found_zt_ip: return
             
             pid = self.peer_counter
-            self.peers[pid] = {'ip': ip, 'port': PORT, 'name': name}
+            self.peers[pid] = {'ip': found_zt_ip, 'port': PORT, 'name': name}
             self.peer_counter += 1
             
-            print(f"\n[+] USUARIO ENCONTRADO: [{pid}] {name} ({ip})")
+            print(f"\n[+] COMPAÑERO EN EL TÚNEL: [{pid}] {name} IP: {found_zt_ip}")
             if self.target_ip is None:
                 print("--> Escribe '/connect <id>' para empezar.")
                 print("Comando > ", end="", flush=True)
@@ -122,23 +138,25 @@ class ChatClient:
 
         peer = self.peers[pid]
         ip = peer['ip']
-        print(f"--> Iniciando Handshake con {peer['name']} ({ip})...")
+        print(f"--> Handshake a {peer['name']} usando ruta segura ({ip})...")
         
-        # Aquí es donde suele fallar si el DNIe no va bien
         session = SessionCrypto(self.key_manager.static_private)
         self.sessions[ip] = session
         my_key = session.get_ephemeral_public_bytes()
         
-        # Enviamos 3 veces por si acaso (UDP es inseguro)
         for _ in range(3):
             self.protocol.send_packet(ip, PORT, MSG_HELLO, 0, my_key)
         
         self.target_ip = ip
-        print("--> Handshake enviado (x3). Esperando...")
+        print("--> Handshake enviado. Si no conecta, revisa el Firewall de Windows (UDP 8888).")
 
     def on_packet(self, packet, addr):
         ip = addr[0] 
         
+        # Filtro extra de seguridad: ignorar paquetes que no vengan del túnel
+        if not ip.startswith(self.network_prefix):
+            return
+
         if packet.msg_type == MSG_HELLO:
             is_new = ip not in self.sessions
             
@@ -147,21 +165,18 @@ class ChatClient:
                 session = SessionCrypto(self.key_manager.static_private)
                 self.sessions[ip] = session
             
-            # RESPONDEMOS SIEMPRE (ACK)
             session = self.sessions[ip]
             my_key = session.get_ephemeral_public_bytes()
+            # Respondemos a la IP que nos habló (que ya sabemos que es la del túnel)
             self.protocol.send_packet(ip, PORT, MSG_HELLO, 0, my_key)
 
             try:
                 self.sessions[ip].perform_handshake(packet.payload, is_initiator=True)
-                
                 if is_new or self.target_ip != ip:
                     print(f"✅ CONEXIÓN ESTABLECIDA CON {ip}")
                     if self.target_ip is None: self.target_ip = ip
                     print("Tú > ", end="", flush=True)
-                    
-            except Exception as e:
-                pass 
+            except Exception: pass 
 
         elif packet.msg_type == MSG_DATA:
             if ip in self.sessions:
@@ -190,13 +205,17 @@ class ChatClient:
             print(f"Error envio: {e}")
 
 async def main():
-    name = sys.argv[1] if len(sys.argv) > 1 else input("Tu nombre: ")
+    if len(sys.argv) > 1:
+        name = sys.argv[1]
+    else:
+        name = input("Tu nombre: ")
     
     try:
         client = ChatClient(name)
         await client.start()
     except Exception as e:
         print(f"Error iniciando cliente: {e}")
+        traceback.print_exc()
         return
 
     input_queue = queue.Queue()
@@ -208,7 +227,7 @@ async def main():
             except: break
     threading.Thread(target=kbd, daemon=True).start()
 
-    print("\n--- SISTEMA LISTO ---")
+    print("\n--- SISTEMA LISTO (MODO ZEROTIER) ---")
     print("Comando > ", end="", flush=True)
 
     while True:
@@ -217,22 +236,15 @@ async def main():
             if msg == "/quit": return
 
             if msg.startswith("/connect"):
-                # BLOQUE DE DEBUG CORREGIDO
                 try:
                     parts = msg.split()
-                    if len(parts) < 2:
-                        print("⚠ Falta el ID. Uso: /connect <número>")
-                    else:
-                        client.connect_by_id(int(parts[1]))
-                except Exception as e:
-                    print(f"\n❌ ERROR AL CONECTAR:")
-                    print(f"Mensaje de error: {e}")
-                    traceback.print_exc() # ESTO IMPRIMIRÁ EL DETALLE REAL
-                    print("Comando > ", end="", flush=True)
+                    if len(parts) < 2: print("Falta ID")
+                    else: client.connect_by_id(int(parts[1]))
+                except: pass
             
             elif msg == "/list":
                  for pid, d in client.peers.items():
-                     print(f"[{pid}] {d['name']}")
+                     print(f"[{pid}] {d['name']} ({d['ip']})")
                  print("Comando > ", end="", flush=True)
             else:
                 if client.target_ip:
