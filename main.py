@@ -49,37 +49,27 @@ class ChatClient:
         if self.transport:
             self.transport.close()
 
-    # --- GESTIÓN DE CONTACTOS (DISCOVERY) ---
     def on_peer_update(self, action, name, info):
-        """
-        Ahora solo guardamos la info, NO iniciamos handshake automáticamente.
-        """
+        # DEBUG: Imprimir TODO lo que llega sin filtros
+        print(f"\n[DEBUG] Discovery evento: {action} -> {name}")
+        
         if action == "ADD" and info:
-            # Extraer IP
             if not info.addresses: return
             ip = socket.inet_ntoa(info.addresses[0])
             
-            # Ignorarnos a nosotros mismos
-            if name.startswith(self.display_name): return
+            print(f"[DEBUG] IP detectada: {ip}. Mi nombre: {self.display_name} vs Otro: {name}")
 
-            # Guardar en la lista de 'Vistos'
+            # Aquí estaba el filtro silencioso
+            if name.startswith(self.display_name): 
+                print("[DEBUG] IGNORADO: Se llama igual que yo.")
+                return
+
             self.discovered_peers[ip] = {'name': name, 'port': info.port}
+            print(f"[EXITO] Añadido a la lista. Total peers: {len(self.discovered_peers)}")
             
-            # Solo avisamos si no estamos chateando para no ensuciar la pantalla
             if self.active_chat_ip is None:
-                print(f"\n[!] Nuevo usuario detectado: {name} ({ip}). Escribe /list para ver.")
+                print(f"\n[!] Nuevo usuario: {name}. Escribe /list.")
                 print("Comando > ", end="", flush=True)
-
-        elif action == "REMOVE":
-            # Eliminar de la lista si se van
-            found_ip = None
-            for ip, data in self.discovered_peers.items():
-                if data['name'] == name:
-                    found_ip = ip
-                    break
-            if found_ip:
-                del self.discovered_peers[found_ip]
-                print(f"\n[!] Usuario desconectado: {name}")
 
     # --- GESTIÓN DE CONEXIÓN (HANDSHAKE) ---
     def connect_to_peer(self, ip):
