@@ -3,8 +3,9 @@ import sys
 import socket
 import threading
 import queue
+import time
 
-# Tus módulos (asegúrate de que se llaman así)
+# Tus módulos
 from discovery import DiscoveryManager
 from crypto import KeyManager, SessionCrypto
 from protocol import ChatProtocol, MSG_HELLO, MSG_DATA
@@ -12,234 +13,193 @@ from protocol import ChatProtocol, MSG_HELLO, MSG_DATA
 # Configuración
 PORT = 8888 
 
+def get_lan_ip():
+    """Obtiene la IP real de la red local (WiFi/Ethernet)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
 class ChatClient:
     def __init__(self, name):
         self.name = name
         self.loop = asyncio.get_running_loop()
+        self.my_ip = get_lan_ip()
         
-        # Identidad y Cifrado
         self.key_manager = KeyManager(f"{name}_identity.json")
-        self.sessions = {}        # Sesiones cifradas activas
-        self.peers = {}           # Lista de usuarios encontrados {index: {ip, port, name}}
-        self.peer_counter = 0     # Para asignar ID 0, 1, 2...
-        self.target_ip = None     # A QUIÉN enviamos los mensajes
+        self.sessions = {}        
+        self.peers = {}           
+        self.peer_counter = 0     
+        self.target_ip = None     
         
-        # Red
         self.protocol = ChatProtocol(self.on_packet)
         self.discovery = DiscoveryManager(name, self.on_discovery)
         self.transport = None
 
     async def start(self):
-        # Abrir puerto
+        print(f"--- INICIANDO EN {self.my_ip}:{PORT} ---")
+        
+        # CORRECCIÓN 1: BIND A LA IP ESPECÍFICA (NO 0.0.0.0)
+        # Esto ayuda a que Windows no se confunda de tarjeta de red
         try:
             self.transport, _ = await self.loop.create_datagram_endpoint(
-                lambda: self.protocol, local_addr=('0.0.0.0', PORT)
+                lambda: self.protocol, local_addr=(self.my_ip, PORT)
             )
         except Exception as e:
-            print(f"Error abriendo puerto {PORT}: {e}")
+            print(f"Error crítico puerto {PORT}: {e}")
             return
 
-        # Iniciar Discovery
-        print(f"--- Cliente '{self.name}' iniciado en puerto {PORT} ---")
-        print("--- Buscando usuarios... (Espera a que aparezcan) ---")
+        print("--- Buscando usuarios... ---")
         await self.discovery.start()
 
-    # --- LÓGICA: DESCUBRIMIENTO ---
     def on_discovery(self, action, name, info):
-        """Se ejecuta solo cuando Discovery encuentra a alguien."""
         if action == "ADD" and info and info.addresses:
             ip = socket.inet_ntoa(info.addresses[0])
-            
-            # Ignorarnos a nosotros mismos
             if name == self.name: return
 
-            # Comprobar si ya lo tenemos por IP
-            known = False
+            # Chequear duplicados
             for p in self.peers.values():
-                if p['ip'] == ip: known = True
+                if p['ip'] == ip: return
             
-            if not known:
-                # Añadir a la lista con un ID numérico simple
-                pid = self.peer_counter
-                self.peers[pid] = {'ip': ip, 'port': info.port, 'name': name}
-                self.peer_counter += 1
-                
-                # AVISO VISIBLE
-                print(f"\n[+] USUARIO ENCONTRADO: [{pid}] {name} ({ip})")
-                # Si no estamos chateando, recordamos cómo conectar
-                if self.target_ip is None:
-                    print("--> Escribe '/connect <id>' para hablar con él.")
-                    print("Comando > ", end="", flush=True)
+            pid = self.peer_counter
+            # Guardamos SIEMPRE el puerto oficial (PORT), ignoramos el aleatorio
+            self.peers[pid] = {'ip': ip, 'port': PORT, 'name': name}
+            self.peer_counter += 1
+            
+            print(f"\n[+] USUARIO ENCONTRADO: [{pid}] {name} ({ip})")
+            if self.target_ip is None:
+                print("--> Escribe '/connect <id>' para empezar.")
+                print("Comando > ", end="", flush=True)
 
-    # --- LÓGICA: CONEXIÓN MANUAL ---
     def connect_by_id(self, pid):
         if pid not in self.peers:
-            print(f"Error: No existe el usuario con ID {pid}")
+            print(f"Error ID {pid}")
             return
 
         peer = self.peers[pid]
         ip = peer['ip']
         print(f"--> Iniciando Handshake con {peer['name']} ({ip})...")
         
-        # Crear sesión
         session = SessionCrypto(self.key_manager.static_private)
         self.sessions[ip] = session
-        
-        # Enviar HELLO
         my_key = session.get_ephemeral_public_bytes()
-        self.protocol.send_packet(ip, peer['port'], MSG_HELLO, 0, my_key)
         
-        # FIJAR OBJETIVO (A partir de ahora mandamos solo a él)
+        # Enviamos 3 veces por si acaso (UDP es inseguro)
+        for _ in range(3):
+            self.protocol.send_packet(ip, PORT, MSG_HELLO, 0, my_key)
+        
         self.target_ip = ip
-        print("--> Handshake enviado. Esperando confirmación...")
+        print("--> Handshake enviado (x3). Esperando...")
 
-    # --- LÓGICA: RED ---
     def on_packet(self, packet, addr):
-        ip, port = addr
+        # CORRECCIÓN 2: Ignoramos el puerto de origen (addr[1])
+        # Asumimos que el otro SIEMPRE escucha en PORT (8888)
+        ip = addr[0] 
         
-        # 1. HANDSHAKE
         if packet.msg_type == MSG_HELLO:
-            if ip not in self.sessions:
-                # Alguien nuevo nos habla
+            # Si no teníamos sesión o el handshake no estaba completo
+            is_new = ip not in self.sessions
+            
+            if is_new:
+                print(f"\n[!] Handshake recibido de {ip}.")
                 session = SessionCrypto(self.key_manager.static_private)
                 self.sessions[ip] = session
-                my_key = session.get_ephemeral_public_bytes()
-                self.protocol.send_packet(ip, PORT, MSG_HELLO, 0, my_key)
             
+            # RESPONDEMOS SIEMPRE (ACK)
+            # Para asegurar que el otro recibe nuestra clave aunque se pierda un paquete
+            session = self.sessions[ip]
+            my_key = session.get_ephemeral_public_bytes()
+            self.protocol.send_packet(ip, PORT, MSG_HELLO, 0, my_key)
+
             try:
+                # Procesamos la clave del otro
                 self.sessions[ip].perform_handshake(packet.payload, is_initiator=True)
-                print(f"\n✅ CONEXIÓN SEGURA LISTA CON {ip}")
                 
-                # Si no habíamos elegido a nadie, fijamos este automáticamente
-                if self.target_ip is None:
-                    self.target_ip = ip
-                    print(f"--> Chat fijado con {ip}. ¡Escribe!")
+                # Solo avisamos si es la primera vez que completamos
+                if is_new or self.target_ip != ip:
+                    print(f"✅ CONEXIÓN ESTABLECIDA CON {ip}")
+                    if self.target_ip is None: self.target_ip = ip
                     print("Tú > ", end="", flush=True)
-                elif self.target_ip == ip:
-                    print("--> Ya puedes escribir.")
-                    print("Tú > ", end="", flush=True)
-
+                    
             except Exception as e:
-                print(f"Error Crypto: {e}")
+                pass # Ignoramos errores de handshake repetidos
 
-        # 2. MENSAJE DE DATOS
         elif packet.msg_type == MSG_DATA:
             if ip in self.sessions:
                 try:
                     msg = self.sessions[ip].decrypt(packet.payload)
-                    # Buscar nombre para mostrarlo bonito
-                    sender_name = ip
+                    name = ip
                     for p in self.peers.values():
-                        if p['ip'] == ip: sender_name = p['name']
+                        if p['ip'] == ip: name = p['name']
                     
-                    print(f"\n[{sender_name}]: {msg}")
-                    
-                    # Volver a pintar el prompt
-                    if self.target_ip:
-                        print("Tú > ", end="", flush=True)
-                    else:
-                        print("Comando > ", end="", flush=True)
-                except:
-                    pass
+                    # Borrar línea actual para que no se rompa el prompt
+                    sys.stdout.write("\r\033[K")
+                    print(f"[{name}]: {msg}")
+                    print("Tú > ", end="", flush=True)
+                except: pass
 
-    # --- LÓGICA: ENVIAR ---
     def send_chat(self, text):
-        if not self.target_ip:
-            print("⚠ Error: No has seleccionado a nadie. Usa /connect <id>")
-            return
-        
+        if not self.target_ip: return
         if self.target_ip not in self.sessions:
-            print("⚠ Error: Handshake no completado.")
+            print("⚠ Esperando handshake...")
             return
 
         try:
-            # Cifrar y enviar solo al TARGET
             session = self.sessions[self.target_ip]
             encrypted = session.encrypt(text)
-            
-            # Buscamos el puerto destino
-            dst_port = PORT
-            for p in self.peers.values():
-                if p['ip'] == self.target_ip: dst_port = p['port']
-
-            self.protocol.send_packet(self.target_ip, dst_port, MSG_DATA, 1, encrypted)
+            self.protocol.send_packet(self.target_ip, PORT, MSG_DATA, 1, encrypted)
         except Exception as e:
-            print(f"Error enviando: {e}")
+            print(f"Error: {e}")
 
 async def main():
-    # Pedir nombre al arrancar
-    name = sys.argv[1] if len(sys.argv) > 1 else input("Tu nombre de usuario: ")
-    
+    name = sys.argv[1] if len(sys.argv) > 1 else input("Tu nombre: ")
     client = ChatClient(name)
     await client.start()
 
-    # Cola para comunicar teclado -> asyncio
     input_queue = queue.Queue()
-
-    # HILO DE TECLADO (Para no bloquear la red)
-    def keyboard_listener():
+    def kbd():
         while True:
             try:
-                # Esto bloquea el hilo, pero NO el programa principal
-                line = sys.stdin.readline()
-                if line: input_queue.put(line.strip())
+                l = sys.stdin.readline()
+                if l: input_queue.put(l.strip())
             except: break
-    
-    threading.Thread(target=keyboard_listener, daemon=True).start()
+    threading.Thread(target=kbd, daemon=True).start()
 
-    print("\n--- INSTRUCCIONES ---")
-    print("1. Espera a ver '[+] USUARIO ENCONTRADO'")
-    print("2. Escribe '/connect 0' (o el número que sea)")
-    print("3. Escribe mensajes para chatear")
-    print("---------------------")
+    print("\n--- SISTEMA LISTO ---")
     print("Comando > ", end="", flush=True)
 
-    # BUCLE PRINCIPAL
     while True:
-        try:
-            # Procesar inputs del teclado si los hay
-            while not input_queue.empty():
-                msg = input_queue.get_nowait()
-                
-                if msg == "/quit":
-                    print("Saliendo...")
-                    return
+        while not input_queue.empty():
+            msg = input_queue.get_nowait()
+            if msg == "/quit": return
 
-                if msg.startswith("/connect"):
-                    try:
-                        pid = int(msg.split()[1])
-                        client.connect_by_id(pid)
-                    except:
-                        print("Uso: /connect <número>")
-                        print("Comando > ", end="", flush=True)
-                
-                elif msg == "/list":
-                    print("\n--- USUARIOS ---")
-                    for pid, data in client.peers.items():
-                        print(f" [{pid}] {data['name']} - {data['ip']}")
-                    if not client.peers: print("(Nadie encontrado aún)")
-                    print("----------------")
-                    print("Comando > ", end="", flush=True)
-
+            if msg.startswith("/connect"):
+                try:
+                    client.connect_by_id(int(msg.split()[1]))
+                except: print("Error comando")
+            elif msg == "/list":
+                 # Mostrar lista
+                 for pid, d in client.peers.items():
+                     print(f"[{pid}] {d['name']}")
+                 print("Comando > ", end="", flush=True)
+            else:
+                if client.target_ip:
+                    client.send_chat(msg)
+                    print("Tú > ", end="", flush=True)
                 else:
-                    # Es un mensaje de chat normal
-                    if client.target_ip:
-                        client.send_chat(msg)
-                        print("Tú > ", end="", flush=True)
-                    else:
-                        print("Comando desconocido o no conectado. Usa /connect <n>")
-                        print("Comando > ", end="", flush=True)
-
-            # Dejar respirar a la red
-            await asyncio.sleep(0.1)
-            
-        except KeyboardInterrupt:
-            break
+                    print("Usa /connect <id>")
+                    print("Comando > ", end="", flush=True)
+        
+        await asyncio.sleep(0.1)
 
 if __name__ == "__main__":
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    except KeyboardInterrupt: pass
