@@ -155,45 +155,65 @@ class ChatClient:
             
             await asyncio.sleep(2)
 
-    # Volvemos a conectar on_packet para procesar lo que llega
     def on_packet(self, packet, addr):
         ip = addr[0]
         if ip == self.my_ip: return 
 
-        # Si recibimos CUALQUIER COSA válida de una IP, significa que existe.
-        if ip not in [p['ip'] for p in self.peers.values()]:
-            
-            # Aceptamos al nuevo peer
-            pid = self.peer_counter
-            # Intentamos adivinar el nombre si el payload del HELLO lo permite, si no, ponemos IP
-            name_guess = f"Usuario_{ip.split('.')[-1]}"
-            
-            self.peers[pid] = {'ip': ip, 'port': PORT, 'name': name_guess}
-            self.peer_counter += 1
-            print(f"\n🌟 ¡DESCUBIERTO! [{pid}] IP: {ip} (Intenta conectarte)")
-            print("Comando > ", end="", flush=True)
-
         if packet.msg_type == MSG_HELLO:
-            # Lógica de handshake normal...
+            # CASO 1: Es un desconocido hablándome (Soy el RESPONDER)
             if ip not in self.sessions:
-                # print(f"Handshake de {ip}")
-                self.sessions[ip] = SessionCrypto(self.key_manager.static_private)
-            
-            # Respondemos para que él también nos descubra
-            try:
-                my_key = self.sessions[ip].get_ephemeral_public_bytes()
+                print(f"\n[!] Solicitud de conexión de {ip}")
+                # Creamos la sesión
+                session = SessionCrypto(self.key_manager.static_private)
+                self.sessions[ip] = session
+                
+                # Procesamos su clave
+                try:
+                    session.perform_handshake(packet.payload, is_initiator=True) # True porque en este protocolo P2P ambos actúan como pares
+                except Exception as e:
+                    print(f"Error Crypto Handshake: {e}")
+                    return
+
+                # IMPORTANTE: Como él inició, YO DEBO RESPONDERLE para que tenga mi clave
+                print(f"    -> Enviando mi clave a {ip}...")
+                my_key = session.get_ephemeral_public_bytes()
                 self.protocol.send_packet(ip, PORT, MSG_HELLO, 0, my_key)
-                self.sessions[ip].perform_handshake(packet.payload, True)
-            except: pass
-            
+
+            # CASO 2: Ya conozco a este tipo (Soy el INICIADOR y me responden)
+            else:
+                # Si ya tengo sesión, significa que YO inicié la charla y él me responde.
+                # NO debo crear sesión nueva. NO debo responderle otra vez (evitar bucle infinito).
+                session = self.sessions[ip]
+                try:
+                    # Simplemente guardo su clave y me callo.
+                    session.perform_handshake(packet.payload, is_initiator=True)
+                    
+                    if self.target_ip != ip:
+                        self.target_ip = ip
+                        print(f"\n✅ ¡CONEXIÓN COMPLETADA CON {ip}!")
+                        print("   Ahora ambos podéis hablar.")
+                        print("Tú > ", end="", flush=True)
+                except Exception as e:
+                    # Si falla aquí, es posible que sea un paquete duplicado, lo ignoramos
+                    pass
+
         elif packet.msg_type == MSG_DATA:
-            # Desencriptar y mostrar...
             if ip in self.sessions:
                 try:
                     msg = self.sessions[ip].decrypt(packet.payload)
-                    print(f"\n[{ip}]: {msg}")
+                    
+                    # Buscar nombre bonito
+                    name = ip
+                    for p in self.peers.values():
+                        if p['ip'] == ip: name = p['name']
+                    
+                    sys.stdout.write("\r\033[K")
+                    print(f"[{name}]: {msg}")
                     print("Tú > ", end="", flush=True)
-                except: pass
+                except Exception:
+                    print(f"\n💀 Error desencriptando mensaje de {ip}. Las claves no coinciden.")
+            else:
+                print(f"\n⚠️ Recibidos datos de {ip} sin sesión. Escribe '/connect {ip}' para arreglarlo.")
 
     def connect_manual(self, ip_target):
         """Conexión manual si falla el discovery"""
