@@ -3,7 +3,7 @@ import sys
 import socket
 import threading
 import queue
-import time
+import traceback # Importante para ver el error real
 
 # Tus módulos
 from discovery import DiscoveryManager
@@ -31,7 +31,14 @@ class ChatClient:
         self.loop = asyncio.get_running_loop()
         self.my_ip = get_lan_ip()
         
-        self.key_manager = KeyManager(f"{name}_identity.json")
+        print("--> Cargando identidad y DNIe...")
+        try:
+            self.key_manager = KeyManager(f"{name}_identity")
+        except Exception as e:
+            print(f"\n❌ ERROR CRÍTICO CARGANDO DNIe/CRIPTOGRAFÍA: {e}")
+            print("Revisa la ruta de la DLL en crypto.py")
+            sys.exit(1)
+
         self.sessions = {}        
         self.peers = {}           
         self.peer_counter = 0     
@@ -44,8 +51,7 @@ class ChatClient:
     async def start(self):
         print(f"--- INICIANDO EN {self.my_ip}:{PORT} ---")
         
-        # CORRECCIÓN 1: BIND A LA IP ESPECÍFICA (NO 0.0.0.0)
-        # Esto ayuda a que Windows no se confunda de tarjeta de red
+        # BIND A LA IP ESPECÍFICA
         try:
             self.transport, _ = await self.loop.create_datagram_endpoint(
                 lambda: self.protocol, local_addr=(self.my_ip, PORT)
@@ -67,7 +73,6 @@ class ChatClient:
                 if p['ip'] == ip: return
             
             pid = self.peer_counter
-            # Guardamos SIEMPRE el puerto oficial (PORT), ignoramos el aleatorio
             self.peers[pid] = {'ip': ip, 'port': PORT, 'name': name}
             self.peer_counter += 1
             
@@ -85,6 +90,7 @@ class ChatClient:
         ip = peer['ip']
         print(f"--> Iniciando Handshake con {peer['name']} ({ip})...")
         
+        # Aquí es donde suele fallar si el DNIe no va bien
         session = SessionCrypto(self.key_manager.static_private)
         self.sessions[ip] = session
         my_key = session.get_ephemeral_public_bytes()
@@ -97,12 +103,9 @@ class ChatClient:
         print("--> Handshake enviado (x3). Esperando...")
 
     def on_packet(self, packet, addr):
-        # CORRECCIÓN 2: Ignoramos el puerto de origen (addr[1])
-        # Asumimos que el otro SIEMPRE escucha en PORT (8888)
         ip = addr[0] 
         
         if packet.msg_type == MSG_HELLO:
-            # Si no teníamos sesión o el handshake no estaba completo
             is_new = ip not in self.sessions
             
             if is_new:
@@ -111,23 +114,20 @@ class ChatClient:
                 self.sessions[ip] = session
             
             # RESPONDEMOS SIEMPRE (ACK)
-            # Para asegurar que el otro recibe nuestra clave aunque se pierda un paquete
             session = self.sessions[ip]
             my_key = session.get_ephemeral_public_bytes()
             self.protocol.send_packet(ip, PORT, MSG_HELLO, 0, my_key)
 
             try:
-                # Procesamos la clave del otro
                 self.sessions[ip].perform_handshake(packet.payload, is_initiator=True)
                 
-                # Solo avisamos si es la primera vez que completamos
                 if is_new or self.target_ip != ip:
                     print(f"✅ CONEXIÓN ESTABLECIDA CON {ip}")
                     if self.target_ip is None: self.target_ip = ip
                     print("Tú > ", end="", flush=True)
                     
             except Exception as e:
-                pass # Ignoramos errores de handshake repetidos
+                pass 
 
         elif packet.msg_type == MSG_DATA:
             if ip in self.sessions:
@@ -137,7 +137,6 @@ class ChatClient:
                     for p in self.peers.values():
                         if p['ip'] == ip: name = p['name']
                     
-                    # Borrar línea actual para que no se rompa el prompt
                     sys.stdout.write("\r\033[K")
                     print(f"[{name}]: {msg}")
                     print("Tú > ", end="", flush=True)
@@ -154,12 +153,17 @@ class ChatClient:
             encrypted = session.encrypt(text)
             self.protocol.send_packet(self.target_ip, PORT, MSG_DATA, 1, encrypted)
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Error envio: {e}")
 
 async def main():
     name = sys.argv[1] if len(sys.argv) > 1 else input("Tu nombre: ")
-    client = ChatClient(name)
-    await client.start()
+    
+    try:
+        client = ChatClient(name)
+        await client.start()
+    except Exception as e:
+        print(f"Error iniciando cliente: {e}")
+        return
 
     input_queue = queue.Queue()
     def kbd():
@@ -179,11 +183,20 @@ async def main():
             if msg == "/quit": return
 
             if msg.startswith("/connect"):
+                # BLOQUE DE DEBUG CORREGIDO
                 try:
-                    client.connect_by_id(int(msg.split()[1]))
-                except: print("Error comando")
+                    parts = msg.split()
+                    if len(parts) < 2:
+                        print("⚠ Falta el ID. Uso: /connect <número>")
+                    else:
+                        client.connect_by_id(int(parts[1]))
+                except Exception as e:
+                    print(f"\n❌ ERROR AL CONECTAR:")
+                    print(f"Mensaje de error: {e}")
+                    traceback.print_exc() # ESTO IMPRIMIRÁ EL DETALLE REAL
+                    print("Comando > ", end="", flush=True)
+            
             elif msg == "/list":
-                 # Mostrar lista
                  for pid, d in client.peers.items():
                      print(f"[{pid}] {d['name']}")
                  print("Comando > ", end="", flush=True)
