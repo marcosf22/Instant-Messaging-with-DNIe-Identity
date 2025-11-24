@@ -1,27 +1,25 @@
 import asyncio
-import os
 import sys
 import socket
 import threading
 import queue
-import traceback
 
-# Módulos de cripto y protocolo (asegúrate de que crypto.py y protocol.py siguen ahí)
+# Importamos tu archivo de criptografía (Asumiendo que crypto.py existe en la carpeta)
 from crypto import KeyManager, SessionCrypto
-from protocol import ChatProtocol, MSG_HELLO, MSG_DATA
+# Importamos el protocolo modificado
+from protocol import ChatProtocol, MSG_HELLO, MSG_DATA, MSG_DISCOVERY
 
 # Configuración
 PORT = 8888 
 
-def get_local_ip():
+def get_best_ip():
     """
-    Truco maestro: Conectamos un socket UDP a Google (8.8.8.8).
-    No se envían datos, pero el Sistema Operativo nos dice automáticamente
-    qué interfaz e IP local está usando para salir.
+    Obtiene la IP que tu ordenador usa para salir al mundo.
+    Funciona tanto para LAN (WiFi) como para VPN si es la ruta por defecto.
     """
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        # No te preocupes, esto no conecta realmente ni gasta datos
+        # Conectamos a una IP pública (Google DNS) para ver qué ruta elige el OS
         s.connect(('8.8.8.8', 1)) 
         IP = s.getsockname()[0]
     except Exception:
@@ -35,24 +33,26 @@ class ChatClient:
         self.name = name
         self.loop = asyncio.get_running_loop()
         
-        # 1. OBTENER IP LOCAL (WiFi/Ethernet)
-        self.my_ip = get_local_ip()
+        # 1. Configuración de Red
+        self.my_ip = get_best_ip()
         
-        # 2. CALCULAR DIRECCIÓN DE BROADCAST
-        # Asumimos una red doméstica estándar (/24).
-        # Si tu IP es 192.168.1.33 -> Broadcast es 192.168.1.255
+        # Calculamos Broadcast (Asumiendo máscara /24 estándar)
+        # Ej: 192.168.1.33 -> 192.168.1.255
         try:
             parts = self.my_ip.split('.')
             self.broadcast_addr = f"{parts[0]}.{parts[1]}.{parts[2]}.255"
         except:
             self.broadcast_addr = "255.255.255.255"
 
-        print(f"--> Tu IP Local: {self.my_ip}")
-        print(f"--> Objetivo Broadcast: {self.broadcast_addr}")
+        print(f"--> Mi IP: {self.my_ip}")
+        print(f"--> Broadcast Target: {self.broadcast_addr}")
 
+        # 2. Criptografía
         try:
             self.key_manager = KeyManager(f"{name}_identity")
-        except: sys.exit(1)
+        except Exception as e:
+            print(f"❌ Error cargando crypto.py: {e}")
+            sys.exit(1)
 
         self.sessions = {}        
         self.peers = {}           
@@ -63,36 +63,35 @@ class ChatClient:
         self.transport = None
 
     async def start(self):
-        print(f"--- INICIANDO EN PUERTO {PORT} ---")
+        print(f"--- CHAT INICIADO EN PUERTO {PORT} ---")
         
-        # Escuchar en 0.0.0.0 permite recibir de cualquiera en la WiFi
+        # Bind a 0.0.0.0 para escuchar por TODAS las interfaces (WiFi, Cable, ZT)
         self.transport, _ = await self.loop.create_datagram_endpoint(
             lambda: self.protocol, 
             local_addr=("0.0.0.0", PORT),
             allow_broadcast=True
         )
         
-        # Iniciamos el radar de descubrimiento
+        # Iniciamos el radar
         self.loop.create_task(self.beacon_loop())
 
     async def beacon_loop(self):
-        """Envía una señal cada 3 segundos a toda la WiFi"""
-        print("--- 📡 Radar Activo (Buscando en LAN) ---")
+        """Envía 'DISCOVERY:Nombre' cada 3 segundos"""
+        print("--- 📡 Radar Activo ---")
         
-        # Socket especial para enviar Broadcast
+        # Socket independiente para enviar Broadcast Raw
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         
-        # Atamos a nuestra IP local para asegurar que sale por la interfaz correcta
+        # Atamos a la IP local para salir por la interfaz correcta
         try:
             sock.bind((self.my_ip, 0))
         except: pass
 
-        msg = f"DISCOVERY:{self.name}".encode()
+        msg = f"DISCOVERY:{self.name}".encode('utf-8')
 
         while True:
             try:
-                # Enviar a la dirección de broadcast calculada (ej: 192.168.1.255)
                 sock.sendto(msg, (self.broadcast_addr, PORT))
             except Exception: pass
             
@@ -102,39 +101,42 @@ class ChatClient:
         ip = addr[0]
         if ip == self.my_ip: return 
 
-        # --- DETECCIÓN DE COMPAÑEROS (DISCOVERY) ---
-        # Si recibimos algo de alguien nuevo, lo apuntamos
-        if ip not in [p['ip'] for p in self.peers.values()]:
-             pid = self.peer_counter
-             self.peers[pid] = {'ip': ip, 'port': PORT, 'name': f"Usuario_{ip.split('.')[-1]}"}
-             self.peer_counter += 1
-             print(f"\n🔭 ¡NUEVO VECINO! [{pid}] IP: {ip}")
-             print("Comando > ", end="", flush=True)
+        # --- CASO 1: Discovery (Texto Plano) ---
+        if packet.msg_type == MSG_DISCOVERY:
+            nombre_compañero = packet.payload # Viene del decode en protocol.py
+            
+            # Si no lo tenemos en la lista, lo añadimos
+            if ip not in [p['ip'] for p in self.peers.values()]:
+                 pid = self.peer_counter
+                 self.peers[pid] = {'ip': ip, 'port': PORT, 'name': nombre_compañero}
+                 self.peer_counter += 1
+                 print(f"\n🔭 ¡COMPAÑERO ENCONTRADO! [{pid}] {nombre_compañero} ({ip})")
+                 print("Comando > ", end="", flush=True)
+            return
 
-        # --- LÓGICA DE MENSAJES ---
+        # --- CASO 2: Handshake (Binario) ---
         if packet.msg_type == MSG_HELLO:
-            # Lógica corregida anti-bucle
             if ip not in self.sessions:
-                print(f"\n[!] Conexión entrante de {ip}")
+                print(f"\n[!] Solicitud de conexión de {ip}")
                 session = SessionCrypto(self.key_manager.static_private)
                 self.sessions[ip] = session
                 try:
                     session.perform_handshake(packet.payload, is_initiator=True)
                     # Respondemos una sola vez
-                    print(f"    -> Respondiendo saludo...")
                     my_key = session.get_ephemeral_public_bytes()
                     self.protocol.send_packet(ip, PORT, MSG_HELLO, 0, my_key)
                 except: pass
             else:
-                # Si ya tenemos sesión, solo procesamos (somos el iniciador recibiendo respuesta)
+                # Ya somos iniciadores, solo procesamos la respuesta
                 try:
                     self.sessions[ip].perform_handshake(packet.payload, is_initiator=True)
                     if self.target_ip != ip:
                         self.target_ip = ip
-                        print(f"\n✅ CONEXIÓN LOCAL ESTABLECIDA CON {ip}")
+                        print(f"\n✅ CONECTADO CON {ip}")
                         print("Tú > ", end="", flush=True)
                 except: pass
 
+        # --- CASO 3: Datos (Chat) ---
         elif packet.msg_type == MSG_DATA:
             if ip in self.sessions:
                 try:
@@ -147,10 +149,9 @@ class ChatClient:
                     print(f"[{name}]: {msg}")
                     print("Tú > ", end="", flush=True)
                 except: 
-                    print("\n💀 Error desencriptando.")
+                    print("\n💀 Error desencriptando (clave incorrecta).")
             else:
-                # Recuperación automática si perdimos el handshake
-                print(f"\n⚠️ Sesión perdida con {ip}. Reconectando...")
+                print(f"\n⚠️ Mensaje de {ip} sin sesión. Intentando reconectar...")
                 self.connect_manual(ip)
 
     def connect_manual(self, ip_target):
@@ -158,7 +159,7 @@ class ChatClient:
         session = SessionCrypto(self.key_manager.static_private)
         self.sessions[ip_target] = session
         my_key = session.get_ephemeral_public_bytes()
-        # En WiFi UDP es más fiable, enviamos 3 veces rápido
+        # Enviar varias veces por si UDP falla
         for _ in range(3):
             self.protocol.send_packet(ip_target, PORT, MSG_HELLO, 0, my_key)
         self.target_ip = ip_target
@@ -171,10 +172,15 @@ class ChatClient:
             except: pass
 
 async def main():
-    name = sys.argv[1] if len(sys.argv) > 1 else input("Tu nombre: ")
+    if len(sys.argv) > 1:
+        name = sys.argv[1]
+    else:
+        name = input("Introduce tu nombre: ")
+    
     client = ChatClient(name)
     await client.start()
 
+    # Input Thread no bloqueante
     input_queue = queue.Queue()
     def kbd():
         while True:
@@ -184,7 +190,7 @@ async def main():
             except: break
     threading.Thread(target=kbd, daemon=True).start()
 
-    print("\n--- CHAT LAN LISTO ---")
+    print("\n--- SISTEMA LISTO ---")
     print("Comando > ", end="", flush=True)
 
     while True:
@@ -196,14 +202,16 @@ async def main():
                 parts = msg.split()
                 if len(parts) > 1:
                     target = parts[1]
-                    # Soporte para conectar por ID o IP
-                    if '.' in target: client.connect_manual(target)
+                    if '.' in target: 
+                        client.connect_manual(target)
                     elif target.isdigit() and int(target) in client.peers:
                         client.connect_manual(client.peers[int(target)]['ip'])
             
             elif msg == "/list":
+                 print("Usuarios detectados:")
                  for pid, d in client.peers.items():
-                     print(f"[{pid}] {d['ip']}")
+                     print(f"[{pid}] {d['name']} - {d['ip']}")
+                 print("Comando > ", end="", flush=True)
             else:
                 client.send_chat(msg)
                 print("Tú > ", end="", flush=True)
