@@ -248,14 +248,26 @@ class SessionCrypto:
         ciphertext = payload[12:]
         return self.cipher.decrypt(nonce, ciphertext, None).decode('utf-8')
     
-    # --- AÑADIR ESTO DENTRO DE LA CLASE SessionCrypto ---
+    # PEGAR ESTO DENTRO DE LA CLASE SessionCrypto EN crypto.py
 
     def export_secret(self):
-        """Convierte la clave compartida a texto hexadecimal para guardarla"""
-        if hasattr(self, 'shared_key') and self.shared_key:
-            return self.shared_key.hex()
+        """Intenta encontrar la clave compartida probando varios nombres comunes"""
+        # Lista de posibles nombres que pudiste haber usado
+        posibles_nombres = ['shared_key', 'key', 'symmetric_key', 'secret', 'derived_key', 'k']
+        
+        for nombre in posibles_nombres:
+            if hasattr(self, nombre):
+                val = getattr(self, nombre)
+                if val is not None and isinstance(val, bytes):
+                    # ¡Encontrado!
+                    return val.hex()
+        
+        # Si llega aquí, es que no encontró la clave en ninguna variable
         return None
 
     def load_secret(self, hex_secret):
-        """Carga una clave desde texto hexadecimal"""
-        self.shared_key = bytes.fromhex(hex_secret)
+        """Carga la clave en la variable estándar 'shared_key' (y 'key' por si acaso)"""
+        key_bytes = bytes.fromhex(hex_secret)
+        self.shared_key = key_bytes
+        self.key = key_bytes # Asignamos a ambas para asegurar compatibilidad
+        self.symmetric_key = key_bytes
