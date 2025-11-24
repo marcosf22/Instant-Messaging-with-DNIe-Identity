@@ -1,81 +1,63 @@
 import asyncio
 import struct
-import logging
 
-# Tipos de mensajes
-MSG_HELLO = 0x01  # Inicio de handshake (envío mi clave efímera)
-MSG_DATA  = 0x02  # Mensaje de chat cifrado
+# Constantes de Tipos de Mensaje
+MSG_HELLO = 1
+MSG_DATA = 2
+MSG_DISCOVERY = 99  # Nuevo tipo para el descubrimiento
 
-logger = logging.getLogger("Protocol")
-
-class Packet:
-    """
-    Clase auxiliar para empaquetar y desempaquetar datos binarios.
-    Formato Header: [ TIPO (1 byte) | CID (4 bytes/entero unsigned) ]
-    """
-    def __init__(self, msg_type, cid, payload):
+class ChatPacket:
+    def __init__(self, msg_type, seq, payload):
         self.msg_type = msg_type
-        self.cid = cid
+        self.seq = seq
         self.payload = payload
 
-    def to_bytes(self):
-        # struct.pack('!BI', ...) significa:
-        # ! = Network Endian (estándar para redes)
-        # B = Unsigned Char (1 byte) -> Tipo
-        # I = Unsigned Int (4 bytes) -> CID
-        header = struct.pack('!BI', self.msg_type, self.cid)
-        return header + self.payload
-
-    @classmethod
-    def from_bytes(cls, data):
-        if len(data) < 5:
-            return None # Paquete corrupto o incompleto
-        
-        # Desempaquetamos los primeros 5 bytes
-        header = data[:5]
-        payload = data[5:]
-        msg_type, cid = struct.unpack('!BI', header)
-        
-        return cls(msg_type, cid, payload)
-
 class ChatProtocol(asyncio.DatagramProtocol):
-    """
-    Maneja el envío y recepción cruda de paquetes UDP.
-    No sabe de criptografía, solo de bytes y direcciones IP.
-    """
-    def __init__(self, on_packet_received):
+    def __init__(self, on_packet_callback):
+        self.on_packet = on_packet_callback
         self.transport = None
-        self.on_packet_received = on_packet_received
 
     def connection_made(self, transport):
         self.transport = transport
-        logger.info(f"Servidor UDP escuchando en: {transport.get_extra_info('sockname')}")
 
     def datagram_received(self, data, addr):
-        """
-        Se dispara automáticamente cuando llega algo por la red.
-        addr es una tupla (IP, Puerto).
-        """
-        packet = Packet.from_bytes(data)
-        if packet:
-            # Pasamos el paquete y la dirección al controlador principal
-            self.on_packet_received(packet, addr)
-        else:
-            logger.warning(f"Paquete corrupto recibido de {addr}")
+        # 1. FILTRO DE DISCOVERY (Texto Plano)
+        # Si el paquete empieza por "DISCOVERY:", lo tratamos como texto simple
+        if data.startswith(b"DISCOVERY:"):
+            try:
+                # Extraemos el nombre: "DISCOVERY:Juan" -> "Juan"
+                nombre_usuario = data.decode('utf-8').split(":")[1]
+                # Creamos un paquete falso interno para pasárselo al main
+                fake_packet = ChatPacket(MSG_DISCOVERY, 0, nombre_usuario)
+                self.on_packet(fake_packet, addr)
+                return
+            except:
+                pass # Si falla, intentamos leerlo como binario normal
 
-    def send_packet(self, ip, port, msg_type, cid, payload):
-        """
-        Construye el paquete y lo envía al destino.
-        """
+        # 2. PROTOCOLO BINARIO (Chat Encriptado)
+        try:
+            # Estructura: Tipo (1 byte) + Secuencia (4 bytes) + Payload (Resto)
+            if len(data) < 5: return 
+            
+            header = data[:5]
+            msg_type, seq = struct.unpack("!BI", header)
+            payload = data[5:]
+            
+            packet = ChatPacket(msg_type, seq, payload)
+            self.on_packet(packet, addr)
+            
+        except Exception:
+            # Ignoramos paquetes corruptos o basura
+            pass
+
+    def send_packet(self, ip, port, msg_type, seq, payload):
         if self.transport:
-            packet = Packet(msg_type, cid, payload)
-            data = packet.to_bytes()
-            self.transport.sendto(data, (ip, port))
-        else:
-            logger.error("Error: El transporte no está listo.")
-
-    def error_received(self, exc):
-        logger.error(f"Error en el transporte UDP: {exc}")
-
-    def connection_lost(self, exc):
-        logger.info("Conexión UDP cerrada.")
+            # Empaquetamos en binario: ! = Network Endian, B = Unsigned Char, I = Unsigned Int
+            header = struct.pack("!BI", msg_type, seq)
+            
+            # Si el payload es string, lo convertimos a bytes, si ya es bytes, lo dejamos
+            if isinstance(payload, str):
+                payload = payload.encode()
+                
+            final_data = header + payload
+            self.transport.sendto(final_data, (ip, port))
