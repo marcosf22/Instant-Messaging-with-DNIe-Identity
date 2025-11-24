@@ -19,10 +19,8 @@ import PyKCS11
 from smartcard.System import readers
 
 # --- CONFIGURACIÓN DE LA LIBRERÍA ---
-# ¡¡¡ VERIFICA QUE ESTA RUTA ES LA CORRECTA EN TU PC !!!
-# Opción A (OpenSC):
+# Asegúrate de que esta ruta es correcta en tu PC
 DLL_PATH = r"C:\Program Files\OpenSC Project\OpenSC\pkcs11\opensc-pkcs11.dll"
-# Opción B (DNIe Oficial):
 # DLL_PATH = r"C:\Windows\System32\DNIe_P11_priv.dll" 
 
 PROTOCOL_NAME = b"Noise_IK_25519_ChaChaPoly_BLAKE2s"
@@ -39,24 +37,17 @@ class DNIeHandler:
             self.lib = self.pkcs11.load(DLL_PATH)
         except Exception as e:
             print(f"ERROR CARGANDO DLL ({DLL_PATH}): {e}")
-            print("Asegúrate de tener OpenSC instalado o cambia la ruta DLL_PATH.")
             sys.exit(1)
 
     def wait_for_card(self):
-        """Espera a que haya un lector y una tarjeta insertada."""
         print("\n--- CONEXIÓN CON DNIe REQUERIDA ---")
-        
-        # 1. Esperar lector
         while True:
             try:
                 lectores_disp = readers()
-                if lectores_disp:
-                    break
+                if lectores_disp: break
             except: pass
-            print("Esperando lector de tarjetas...", end="\r")
             time.sleep(1)
 
-        # 2. Esperar tarjeta
         while True:
             try:
                 slots = self.pkcs11.getSlotList(tokenPresent=True)
@@ -64,12 +55,10 @@ class DNIeHandler:
                     self.slot = slots[0]
                     break
             except: pass
-            print("Por favor, inserta el DNIe...", end="\r")
             time.sleep(1)
-        print("Tarjeta DNIe detectada.                  ")
+        print("Tarjeta DNIe detectada.")
 
     def login(self):
-        """Pide el PIN e inicia sesión."""
         self.wait_for_card()
         password = None
         while not password:
@@ -80,7 +69,7 @@ class DNIeHandler:
             self.session.login(password)
             print("PIN Correcto. Sesión abierta.")
         except Exception as e:
-            print(f"Error de login (¿PIN incorrecto?): {e}")
+            print(f"Error de login: {e}")
             sys.exit(1)
 
     def logout(self):
@@ -91,7 +80,6 @@ class DNIeHandler:
             except: pass
 
     def find_auth_certificate(self):
-        """Busca el objeto certificado de Autenticación en el chip."""
         objs = self.session.findObjects([(PyKCS11.CKA_CLASS, PyKCS11.CKO_CERTIFICATE)])
         for obj in objs:
             try:
@@ -99,34 +87,26 @@ class DNIeHandler:
                 if not val: continue
                 cert_der = bytes(val[0])
                 cert = x509.load_der_x509_certificate(cert_der, default_backend())
-                
                 subject = cert.subject.rfc4514_string().upper()
-                # Buscamos cualquier certificado de firma o autenticación
                 if "AUTENTICA" in subject or "FIRMA" in subject:
                     return obj, cert_der
             except: continue
         return None, None
 
     def find_private_key(self):
-        """Busca la clave privada asociada."""
         keys = self.session.findObjects([(PyKCS11.CKA_CLASS, PyKCS11.CKO_PRIVATE_KEY)])
         for key in keys:
             label_attr = self.session.getAttributeValue(key, [PyKCS11.CKA_LABEL])
             if label_attr and label_attr[0]:
-                label = label_attr[0]
-                if label == "KprivAutenticacion":
+                if label_attr[0] == "KprivAutenticacion":
                     return key
         return keys[0] if keys else None
 
     def sign_data(self, data_bytes):
-        """Firma bytes usando la clave privada del DNIe."""
         priv_key = self.find_private_key()
-        if not priv_key:
-            raise Exception("No se encontró la clave privada en el DNIe.")
-        
+        if not priv_key: raise Exception("No se encontró clave privada en DNIe.")
         mechanism = PyKCS11.Mechanism(PyKCS11.CKM_SHA256_RSA_PKCS, None)
-        signature = bytes(self.session.sign(priv_key, data_bytes, mechanism))
-        return signature
+        return bytes(self.session.sign(priv_key, data_bytes, mechanism))
 
 class KeyManager:
     """Gestiona la identidad híbrida (X25519 + DNIe)."""
@@ -136,7 +116,6 @@ class KeyManager:
         
         self.static_private = None
         self.static_public = None
-        self.dnie_cert_der = None
         
         self._load_or_gen_x25519()
         self._load_or_extract_dnie()
@@ -148,10 +127,8 @@ class KeyManager:
                     data = json.load(f)
                     priv_bytes = bytes.fromhex(data['private_key'])
                     self.static_private = x25519.X25519PrivateKey.from_private_bytes(priv_bytes)
-            except:
-                self._generate_x25519()
-        else:
-            self._generate_x25519()
+            except: self._generate_x25519()
+        else: self._generate_x25519()
         self.static_public = self.static_private.public_key()
 
     def _generate_x25519(self):
@@ -165,27 +142,13 @@ class KeyManager:
             json.dump({'private_key': priv_bytes.hex()}, f)
 
     def _load_or_extract_dnie(self):
-        if os.path.exists(self.cert_file):
-            print(f"✔ Certificado encontrado en {self.cert_file}. Cargando...")
-            try:
-                with open(self.cert_file, "rb") as f:
-                    self.dnie_cert_der = f.read()
-            except: pass
-        else:
-            print(f"⚠ No se encuentra {self.cert_file}. Iniciando extracción DNIe...")
+        if not os.path.exists(self.cert_file):
+            print(f"⚠ Extrayendo certificado del DNIe...")
             handler = DNIeHandler()
             handler.login()
-            
             _, cert_der = handler.find_auth_certificate()
-            if not cert_der:
-                print("❌ No se encontró certificado en el DNIe.")
-                handler.logout()
-                sys.exit(1)
-            
-            self.dnie_cert_der = cert_der
-            with open(self.cert_file, "wb") as f:
-                f.write(cert_der)
-            print("✔ Certificado extraído y guardado.")
+            if not cert_der: sys.exit(1)
+            with open(self.cert_file, "wb") as f: f.write(cert_der)
             handler.logout()
 
     def sign_my_static_key(self):
@@ -200,23 +163,15 @@ class KeyManager:
         handler.logout()
         return signature
 
-    def get_public_bytes(self):
-        return self.static_public.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
-        )
-
 class SessionCrypto:
     """Maneja el cifrado de la sesión."""
     def __init__(self, private_key):
         self.my_static_private = private_key
         self.cipher = None
-        # Generamos solo la privada
+        self.shared_key = None # <--- IMPORTANTE: Variable para guardar la clave
         self.ephemeral_private = x25519.X25519PrivateKey.generate()
 
     def get_ephemeral_public_bytes(self):
-        # --- CORRECCIÓN AQUÍ ---
-        # Derivamos la pública desde la privada en el momento
         return self.ephemeral_private.public_key().public_bytes(
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw
@@ -232,7 +187,13 @@ class SessionCrypto:
             salt=None,
             info=PROTOCOL_NAME,
         )
+        # 1. Calculamos la clave
         key_material = hkdf.derive(shared_secret)
+        
+        # 2. LA GUARDAMOS EN LA CLASE (Esto faltaba antes)
+        self.shared_key = key_material
+        
+        # 3. Creamos el cifrador
         self.cipher = ChaCha20Poly1305(key_material)
         return True
 
@@ -248,26 +209,17 @@ class SessionCrypto:
         ciphertext = payload[12:]
         return self.cipher.decrypt(nonce, ciphertext, None).decode('utf-8')
     
-    # PEGAR ESTO DENTRO DE LA CLASE SessionCrypto EN crypto.py
+    # --- MÉTODOS DE PERSISTENCIA CORREGIDOS ---
 
     def export_secret(self):
-        """Intenta encontrar la clave compartida probando varios nombres comunes"""
-        # Lista de posibles nombres que pudiste haber usado
-        posibles_nombres = ['shared_key', 'key', 'symmetric_key', 'secret', 'derived_key', 'k']
-        
-        for nombre in posibles_nombres:
-            if hasattr(self, nombre):
-                val = getattr(self, nombre)
-                if val is not None and isinstance(val, bytes):
-                    # ¡Encontrado!
-                    return val.hex()
-        
-        # Si llega aquí, es que no encontró la clave en ninguna variable
+        """Devuelve la clave guardada en hexadecimal"""
+        if self.shared_key:
+            return self.shared_key.hex()
         return None
 
     def load_secret(self, hex_secret):
-        """Carga la clave en la variable estándar 'shared_key' (y 'key' por si acaso)"""
+        """Carga la clave desde hex y RECREA EL CIFRADOR"""
         key_bytes = bytes.fromhex(hex_secret)
         self.shared_key = key_bytes
-        self.key = key_bytes # Asignamos a ambas para asegurar compatibilidad
-        self.symmetric_key = key_bytes
+        # ¡CRUCIAL! Recreamos el motor de cifrado con la clave cargada
+        self.cipher = ChaCha20Poly1305(key_bytes)
