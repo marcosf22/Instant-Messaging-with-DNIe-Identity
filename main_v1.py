@@ -82,19 +82,28 @@ class ChatClient:
             print(f"⚠️ Error cargando sesiones: {e}")
 
     def save_sessions_to_disk(self):
-        """Guarda todas las sesiones activas a disco"""
+        print("\n💾 [DEBUG] Iniciando guardado de sesiones...") 
         data_to_save = {}
+        
+        if not self.sessions:
+            print("   ⚠️ No hay sesiones activas en memoria para guardar.")
+        
         for ip, session in self.sessions.items():
-            key_hex = session.export_secret() # Usamos la función que añadiste
+            key_hex = session.export_secret()
+            
             if key_hex:
+                print(f"   ✅ IP: {ip} -> Clave encontrada (Empieza por {key_hex[:6]}...)")
                 data_to_save[ip] = key_hex
+            else:
+                print(f"   ❌ IP: {ip} -> session.export_secret() devolvió None.")
+                print("      (Revisa los nombres de variables en crypto.py)")
         
         try:
             with open(SESSION_FILE, 'w') as f:
-                json.dump(data_to_save, f)
-            # print("💾 Sesiones guardadas.")
+                json.dump(data_to_save, f, indent=4)
+            print(f"   📂 Archivo {SESSION_FILE} actualizado.\n")
         except Exception as e:
-            print(f"❌ Error guardando sesiones: {e}")
+            print(f"   ❌ Error escribiendo fichero: {e}")
 
     async def start(self):
         print(f"--- CHAT INICIADO EN PUERTO {PORT} ---")
