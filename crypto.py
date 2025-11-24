@@ -247,3 +247,15 @@ class SessionCrypto:
         nonce = payload[:12]
         ciphertext = payload[12:]
         return self.cipher.decrypt(nonce, ciphertext, None).decode('utf-8')
+    
+    # --- AÑADIR ESTO DENTRO DE LA CLASE SessionCrypto ---
+
+    def export_secret(self):
+        """Convierte la clave compartida a texto hexadecimal para guardarla"""
+        if hasattr(self, 'shared_key') and self.shared_key:
+            return self.shared_key.hex()
+        return None
+
+    def load_secret(self, hex_secret):
+        """Carga una clave desde texto hexadecimal"""
+        self.shared_key = bytes.fromhex(hex_secret)
