@@ -3,17 +3,18 @@ import sys
 import socket
 import json
 import os
+import threading
 import zlib
 import struct
 import pygame
 from datetime import datetime
 from PIL import Image as PILImage, ImageSequence
 
-# --- MÓDULOS PROPIOS ---
+# Módulos propios
 from crypto import KeyManager, SessionCrypto
 from protocol import ChatProtocol, MSG_HELLO, MSG_DATA, MSG_DISCOVERY, MSG_AUTH
 
-# --- CONFIGURACIÓN VISUAL ---
+# Configuración
 ANCHO, ALTO = 950, 650 
 COLOR_FONDO = (0, 10, 0) 
 COLOR_TEXTO = (50, 220, 50)      
@@ -21,12 +22,11 @@ COLOR_TEXTO_YO = (150, 255, 150)
 COLOR_MARCO = (20, 100, 20)
 COLOR_SYS   = (50, 150, 150)
 
-# ESTADOS DE LOS BOTONES
-BTN_IDLE    = (0, 40, 0)        # Estado normal (Para llamar)
-BTN_HOVER   = (0, 70, 0)        # Ratón encima
-BTN_ACTIVE  = (0, 100, 0)       # Ya conectado
-BTN_ALERT   = (180, 100, 0)     # ¡LLAMADA ENTRANTE! (Naranja)
-BTN_VERIFIED = (218, 165, 32)   # Verificado DNIe (Dorado)
+BTN_IDLE    = (0, 40, 0)
+BTN_HOVER   = (0, 70, 0)
+BTN_ACTIVE  = (0, 100, 0)
+BTN_ALERT   = (180, 100, 0)
+BTN_VERIFIED = (218, 165, 32)
 
 PORT = 8888
 SESSION_FILE = "sessions.json"
@@ -34,98 +34,77 @@ SESSION_FILE = "sessions.json"
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-# ==========================================
-# 1. UTILIDADES GRÁFICAS
-# ==========================================
+# --- UTILIDADES ---
 def wrap_text(text, font, max_width):
     words = text.split(' ')
     lines = []
-    current_line = ""
-    for word in words:
-        test_line = current_line + " " + word if current_line else word
-        w, _ = font.size(test_line)
-        if w <= max_width: current_line = test_line
+    current = ""
+    for w in words:
+        test = current + " " + w if current else w
+        if font.size(test)[0] <= max_width: current = test
         else:
-            if current_line: lines.append(current_line)
-            current_line = word
-    if current_line: lines.append(current_line)
+            if current: lines.append(current)
+            current = w
+    if current: lines.append(current)
     return lines
 
 def load_gif_frames(filepath, size=None):
     frames = []
     if not os.path.exists(filepath): return []
     try:
-        pil_img = PILImage.open(filepath)
-        for frame in ImageSequence.Iterator(pil_img):
-            frame_rgba = frame.convert("RGBA")
-            py_img = pygame.image.fromstring(frame_rgba.tobytes(), frame_rgba.size, frame_rgba.mode).convert_alpha()
-            if size: py_img = pygame.transform.scale(py_img, size)
-            frames.append(py_img)
+        pil = PILImage.open(filepath)
+        for f in ImageSequence.Iterator(pil):
+            fr = f.convert("RGBA")
+            py = pygame.image.fromstring(fr.tobytes(), fr.size, fr.mode).convert_alpha()
+            if size: py = pygame.transform.scale(py, size)
+            frames.append(py)
     except: pass
     return frames
 
 class CodecCharacterLoader:
     def __init__(self):
-        self.characters = {}
-        self.sorted_keys = []
-        self.load_characters()
-
-    def load_characters(self):
-        char_folder = os.path.join("assets", "characters")
-        if not os.path.exists(char_folder): os.makedirs(char_folder, exist_ok=True)
-        
-        # Default fallback
-        s = pygame.Surface((150, 200)); s.fill((0, 20, 0))
+        self.chars = {}; self.keys = []
+        self.load()
+    def load(self):
+        f = os.path.join("assets", "characters")
+        if not os.path.exists(f): os.makedirs(f, exist_ok=True)
+        s = pygame.Surface((150, 200)); s.fill((0,20,0))
         pygame.draw.rect(s, COLOR_TEXTO, (0,0,150,200), 2)
-        self.characters['default'] = [s]
+        self.chars['default'] = [s]
+        for file in os.listdir(f):
+            if file.endswith('.gif'):
+                frames = load_gif_frames(os.path.join(f, file), (150,200))
+                if frames: self.chars[file.split('.')[0].lower()] = frames
+        self.keys = sorted(list(self.chars.keys()))
+    def get(self, uid):
+        if not self.keys: return self.chars['default']
+        return self.chars[self.keys[zlib.crc32(str(uid).encode()) % len(self.keys)]]
 
-        for f in os.listdir(char_folder):
-            if f.endswith('.gif'):
-                name = f.split('.')[0].lower()
-                frames = load_gif_frames(os.path.join(char_folder, f), size=(150, 200))
-                if frames: self.characters[name] = frames
-        
-        self.sorted_keys = sorted(list(self.characters.keys()))
-
-    def get_frames(self, unique_id):
-        if not self.sorted_keys: return self.characters['default']
-        try: val = zlib.crc32(str(unique_id).encode())
-        except: val = 0
-        return self.characters[self.sorted_keys[val % len(self.sorted_keys)]]
-
-# ==========================================
-# 2. ESTADO GLOBAL DE LA APP
-# ==========================================
 class AppState:
     def __init__(self):
-        self.peers = {}         
-        self.incoming_ids = []  # Lista de IDs que nos están llamando
-        self.messages = []      
+        self.peers = {}
+        self.incoming_ids = []
+        self.messages = []
         self.input_text = ""
         self.my_name = "Snake"
-        self.target_name = None 
-        self.status_msg = "EN LOBBY - Esperando..."
-        self.talking_timer = {} 
-        self.sound_queue = []   
-
-    def add_message(self, sender, text, is_me=False, is_sys=False):
-        timestamp = datetime.now().strftime("%H:%M")
-        self.messages.append({'sender': sender, 'text': text, 'is_me': is_me, 'is_sys': is_sys, 'time': timestamp})
+        self.target_name = None
+        self.status_msg = "EN LOBBY"
+        self.talking_timer = {}
+        self.sound_queue = []
+    def add_message(self, snd, txt, is_me=False, is_sys=False):
+        t = datetime.now().strftime("%H:%M")
+        self.messages.append({'sender': snd, 'text': txt, 'is_me': is_me, 'is_sys': is_sys, 'time': t})
         if not is_sys:
-            self.talking_timer[sender] = pygame.time.get_ticks() + 2500
+            self.talking_timer[snd] = pygame.time.get_ticks() + 2500
             if not is_me: self.sound_queue.append("msg")
-
-    def is_talking(self, user_name):
-        return user_name in self.talking_timer and pygame.time.get_ticks() < self.talking_timer[user_name]
-
-    def set_status(self, txt): self.status_msg = txt
+    def is_talking(self, name):
+        return name in self.talking_timer and pygame.time.get_ticks() < self.talking_timer[name]
+    def set_status(self, t): self.status_msg = t
 
 STATE = AppState()
-CHARS = None 
+CHARS = None
 
-# ==========================================
-# 3. LOGICA DE CHAT (BACKEND)
-# ==========================================
+# --- RED ---
 def get_best_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try: s.connect(('8.8.8.8', 1)); IP = s.getsockname()[0]
@@ -139,41 +118,29 @@ class ChatClient:
         self.loop = asyncio.get_running_loop()
         self.my_ip = get_best_ip()
         self.broadcast_addr = "255.255.255.255"
-        
-        try: self.key_manager = KeyManager(f"{name}_identity")
-        except: sys.exit(1)
-
-        self.sessions = {}        
-        self.peers = {}           
-        self.peer_counter = 0     
-        self.target_ip = None     
-        self.pending_requests = {} 
-        self.verified_users = {} 
-
+        self.key_manager = KeyManager(f"{name}_identity")
+        self.sessions = {}
+        self.peers = {}
+        self.peer_counter = 0
+        self.target_ip = None
+        self.pending_requests = {}
+        self.verified_users = {}
         self.protocol = ChatProtocol(self.on_packet)
         self.load_sessions_from_disk()
 
-    # --- DNIe PREVIO ---
     def iniciar_dnie_antes_de_gui(self):
-        print("\n🔐 INICIANDO SISTEMA DE SEGURIDAD DNIe...")
-        if self.key_manager.iniciar_sesion_dnie():
-            print("✅ DNIe Listo. Abriendo Interfaz...")
-            return True
-        else:
-            print("❌ Fallo en DNIe. Abriendo sin firma...")
-            return False
+        return self.key_manager.iniciar_sesion_dnie()
 
-    # --- PERSISTENCIA ---
     def load_sessions_from_disk(self):
         if not os.path.exists(SESSION_FILE): return
         try:
-            with open(SESSION_FILE, 'r') as f: saved_data = json.load(f)
-            count = 0
-            for ip, hex_key in saved_data.items():
-                s = SessionCrypto(self.key_manager.static_private) # type: ignore
-                try: s.load_secret(hex_key); self.sessions[ip] = s; count += 1
+            with open(SESSION_FILE, 'r') as f: d = json.load(f)
+            c = 0
+            for ip, hx in d.items():
+                s = SessionCrypto() # ARREGLADO: Sin argumentos
+                try: s.load_secret(hx); self.sessions[ip] = s; c += 1
                 except: pass
-            if count > 0: STATE.add_message("SYS", f"💾 {count} sesiones cargadas.", is_sys=True)
+            if c > 0: STATE.add_message("SYS", f"💾 {c} sesiones cargadas.", True)
         except: pass
 
     def save_sessions_to_disk(self):
@@ -182,7 +149,6 @@ class ChatClient:
             with open(SESSION_FILE, 'w') as f: json.dump(d, f, indent=4)
         except: pass
 
-    # --- RED ---
     async def start(self):
         self.transport, _ = await self.loop.create_datagram_endpoint(
             lambda: self.protocol, local_addr=("0.0.0.0", PORT), allow_broadcast=True
@@ -200,66 +166,63 @@ class ChatClient:
             except: pass
             await asyncio.sleep(3)
 
-    # --- VERIFICACIÓN ---
     def send_verification(self):
-        if not self.target_ip: return STATE.add_message("SYS", "⛔ Conecta primero.", is_sys=True)
-        STATE.add_message("SYS", "💳 Firmando con DNIe...", is_sys=True)
+        if not self.target_ip: return STATE.add_message("SYS", "⛔ Conecta primero.", True)
+        STATE.add_message("SYS", "💳 Firmando...", True)
         threading.Thread(target=self._firmar_y_enviar, daemon=True).start()
 
     def _firmar_y_enviar(self):
         try:
+            # ARREGLADO: Usamos get_public_bytes
             clave_pub = self.sessions[self.target_ip].get_public_bytes() 
             cert, firma = self.key_manager.firmar_handshake(clave_pub)
             if not cert: return
-
+            
             payload = struct.pack("!I", len(cert)) + cert + \
                       struct.pack("!I", len(firma)) + firma + \
                       clave_pub
             
             enc = self.sessions[self.target_ip].encrypt(payload.decode('latin1'))
             self.loop.call_soon_threadsafe(self.protocol.send_packet, self.target_ip, PORT, MSG_AUTH, 0, enc)
-            STATE.add_message("SYS", "📤 Identidad enviada.", is_sys=True)
-        except Exception as e:
-            STATE.add_message("SYS", f"❌ Error DNIe: {e}", is_sys=True)
+            STATE.add_message("SYS", "📤 Identidad enviada.", True)
+        except Exception as e: STATE.add_message("SYS", f"❌ Error DNIe: {e}", True)
 
-    # --- RECEPCIÓN ---
     def on_packet(self, pkt, addr):
         ip = addr[0]
         if ip == self.my_ip: return
 
-        # DISCOVERY
         if pkt.msg_type == MSG_DISCOVERY:
-            name = pkt.payload.decode('utf-8', 'ignore') if isinstance(pkt.payload, bytes) else str(pkt.payload)
+            n = pkt.payload.decode('utf-8', 'ignore') if isinstance(pkt.payload, bytes) else str(pkt.payload)
             if ip not in [p['ip'] for p in self.peers.values()]:
-                pid = self.peer_counter; self.peers[pid] = {'ip': ip, 'name': name}; self.peer_counter += 1
+                pid = self.peer_counter; self.peers[pid] = {'ip': ip, 'name': n}; self.peer_counter += 1
                 STATE.peers = self.peers.copy()
                 if not self.target_ip: 
                     STATE.sound_queue.append("contact")
-                    STATE.add_message("SYS", f"Radar: {name}", is_sys=True)
+                    STATE.add_message("SYS", f"Radar: {n}", True)
 
-        # HELLO (Handshake / Llamada)
         elif pkt.msg_type == MSG_HELLO:
             if ip in self.sessions:
                 try:
-                    self.sessions[ip].perform_handshake(pkt.payload, True)
+                    self.sessions[ip].compute_secret(pkt.payload) # Renegociar
                     self.save_sessions_to_disk()
                     STATE.sound_queue.append("open")
-                    STATE.add_message("SYS", f"✅ CONEXIÓN OK: {ip}", is_sys=True)
+                    STATE.add_message("SYS", f"✅ CONEXIÓN OK: {ip}", True)
                 except: pass
             elif ip not in self.pending_requests:
                 self.pending_requests[ip] = pkt.payload
-                # BUSCAR ID PARA MARCARLO EN ROJO (INCOMING)
+                name = ip
+                for d in self.peers.values(): 
+                    if d['ip'] == ip: name = d['name']
+                
                 pid_found = -1
                 for pid, d in self.peers.items():
                     if d['ip'] == ip: pid_found = pid
-                
                 if pid_found != -1 and pid_found not in STATE.incoming_ids:
                     STATE.incoming_ids.append(pid_found)
 
                 STATE.sound_queue.append("call")
-                STATE.add_message("SYS", f"🔔 LLAMADA DE {ip}. ¡PULSA EL BOTÓN!", is_sys=True)
+                STATE.add_message("SYS", f"🔔 LLAMADA DE {name}", True)
 
-        # DATA
         elif pkt.msg_type == MSG_DATA:
             if ip in self.sessions:
                 try:
@@ -274,7 +237,6 @@ class ChatClient:
                     self.connect_manual(ip)
             else: self.connect_manual(ip)
 
-        # AUTH
         elif pkt.msg_type == MSG_AUTH:
             if ip in self.sessions:
                 try:
@@ -285,57 +247,57 @@ class ChatClient:
                     l_s = struct.unpack("!I", dec[off:off+4])[0]; off+=4
                     sig = dec[off:off+l_s]; off+=l_s
                     pk = dec[off:] 
-
-                    valid, cn = self.key_manager.verificar_handshake(pk, cert, sig)
                     
+                    valid, cn = self.key_manager.verificar_handshake(pk, cert, sig)
                     if valid:
                         STATE.sound_queue.append("open")
-                        STATE.add_message("SYS", f"✅ DNIe VERIFICADO: {cn}", is_sys=True)
+                        STATE.add_message("SYS", f"✅ DNIe VERIFICADO: {cn}", True)
                         self.verified_users[ip] = f"{cn} [✓]"
                         if self.target_ip == ip:
                             STATE.target_name = self.verified_users[ip]
                             STATE.set_status(f"CONECTADO: {STATE.target_name}")
-                    else:
-                        STATE.add_message("SYS", f"❌ FIRMA FALSA", is_sys=True)
+                    else: STATE.add_message("SYS", f"❌ FIRMA FALSA", True)
                 except: pass
 
-    # --- ACCIONES CLICABLES ---
     def connect_manual(self, ip, name="Unknown"):
-        """Llamar a alguien (Click en botón verde)"""
         if ip in self.sessions:
             real = self.verified_users.get(ip, name)
             self.target_ip, STATE.target_name = ip, real
             STATE.set_status(f"CONECTADO: {real}")
-            STATE.add_message("SYS", "Retomando chat.", is_sys=True)
+            STATE.add_message("SYS", "Retomando chat.", True)
             return
 
-        STATE.add_message("SYS", f"--> Llamando a {name}...", is_sys=True)
-        s = SessionCrypto(self.key_manager.static_private) # type: ignore
+        STATE.add_message("SYS", f"--> Llamando a {name}...", True)
+        # ARREGLADO: Sin argumentos
+        s = SessionCrypto()
         self.sessions[ip] = s
-        mk = s.get_ephemeral_public_bytes()
+        
+        # ARREGLADO: get_public_bytes
+        mk = s.get_public_bytes()
+        
         for _ in range(3): self.protocol.send_packet(ip, PORT, MSG_HELLO, 0, mk)
         self.target_ip, STATE.target_name = ip, name
         STATE.set_status(f"LLAMANDO A {name}...")
 
     def accept_connection(self, pid):
-        """Aceptar llamada (Click en botón naranja)"""
         if pid not in self.peers: return
         ip = self.peers[pid]['ip']
         name = self.peers[pid]['name']
-
         if ip not in self.pending_requests: return
         
-        STATE.add_message("SYS", "Conectando...", is_sys=True)
-        s = SessionCrypto(self.key_manager.static_private) # type: ignore
+        STATE.add_message("SYS", "Conectando...", True)
+        # ARREGLADO: Sin argumentos
+        s = SessionCrypto()
         self.sessions[ip] = s
-        s.perform_handshake(self.pending_requests[ip], True)
-        mk = s.get_ephemeral_public_bytes()
+        s.compute_secret(self.pending_requests[ip])
+        
+        # ARREGLADO: get_public_bytes
+        mk = s.get_public_bytes()
+        
         for _ in range(3): self.protocol.send_packet(ip, PORT, MSG_HELLO, 0, mk)
         
         del self.pending_requests[ip]
-        # QUITAR DE LA LISTA DE LLAMADAS ENTRANTES
         if pid in STATE.incoming_ids: STATE.incoming_ids.remove(pid)
-        
         self.save_sessions_to_disk()
         self.target_ip = ip
         STATE.target_name = name
@@ -355,21 +317,15 @@ class ChatClient:
         elif text == "/leave":
             self.target_ip = None
             STATE.set_status("LOBBY")
-            STATE.add_message("SYS", "Desconectado.", is_sys=True)
+            STATE.add_message("SYS", "Desconectado.", True)
         elif self.target_ip: self.send_msg(text)
 
-# ==========================================
-# 4. INTERFAZ DE USUARIO (FRONTEND)
-# ==========================================
 class CodecDisplay:
     def __init__(self, size):
-        self.bg_frames = load_gif_frames("assets/codec_background.gif", size=(ANCHO, 350))
-        if not self.bg_frames:
-            s = pygame.Surface((ANCHO, 350)); s.fill((10,30,10)); self.bg_frames=[s]
+        self.bg_frames = load_gif_frames("assets/codec_background.gif", (ANCHO, 350))
+        if not self.bg_frames: self.bg_frames=[pygame.Surface((ANCHO, 350))]
         self.frame_idx = 0
-        # Lista de zonas clickables: [(Rect, PID, TIPO_ACCION)]
         self.active_buttons = []
-        
         try: pygame.mixer.init(); self.snd = {
             "call": pygame.mixer.Sound("assets/call.mp3"),
             "msg": pygame.mixer.Sound("assets/call.mp3"),
@@ -388,69 +344,38 @@ class CodecDisplay:
         screen.fill(COLOR_FONDO)
         screen.blit(self.bg_frames[self.frame_idx], (0, 20))
         screen.blit(font_ui.render(STATE.status_msg, True, COLOR_TEXTO), (20, 5))
-
-        # Caras
         self._draw_face(screen, STATE.my_name, 675, 30)
         if STATE.target_name: self._draw_face(screen, STATE.target_name, 130, 30)
 
-        # Layout
-        h_chat = 340
-        y_base = 238
+        h_chat, y_base = 340, 238
         sidebar = pygame.Rect(30, y_base, 200, h_chat)
         chat = pygame.Rect(240, y_base, 680, h_chat)
 
-        # --- DIBUJAR LISTA DE CONTACTOS (BOTONES) ---
-        pygame.draw.rect(screen, (0,15,0), sidebar)
-        pygame.draw.rect(screen, COLOR_MARCO, sidebar, 2)
-        
+        pygame.draw.rect(screen, (0,15,0), sidebar); pygame.draw.rect(screen, COLOR_MARCO, sidebar, 2)
         y_btn = sidebar.top + 10
-        self.active_buttons = [] # Reiniciamos zonas clickables
-        mx, my = pygame.mouse.get_pos()
+        self.active_buttons = []
         
         for pid, d in STATE.peers.items():
-            # Determinar color y estado del botón
             is_verif = "[✓]" in client.verified_users.get(d['ip'], "")
-            is_incoming = pid in STATE.incoming_ids # ¿Nos está llamando?
-            is_connected = (client.target_ip == d['ip'])
-
-            col = BTN_IDLE
-            label = "CALL"
+            is_in = pid in STATE.incoming_ids
+            is_conn = client.target_ip == d['ip']
+            col = BTN_VERIFIED if is_verif else (BTN_ALERT if is_in else (BTN_ACTIVE if is_conn else BTN_IDLE))
             
-            if is_connected:
-                col = BTN_ACTIVE
-                label = "LINKED"
-            elif is_incoming:
-                # Parpadeo Naranja
-                if (pygame.time.get_ticks() // 500) % 2 == 0: col = BTN_ALERT
-                else: col = (100, 50, 0)
-                label = "ACCEPT !"
-            elif is_verif:
-                col = BTN_VERIFIED
-                label = "SECURE"
+            r = pygame.Rect(sidebar.left+5, y_btn, 190, 30)
+            pygame.draw.rect(screen, col, r)
+            pygame.draw.rect(screen, COLOR_MARCO, r, 1)
             
-            # Rectángulo del botón
-            rect = pygame.Rect(sidebar.left+5, y_btn, 190, 30)
+            lbl = f"{d['name'][:9]}"
+            if is_verif: lbl += " [✓]"
+            screen.blit(font.render(lbl, True, COLOR_TEXTO), (r.x+5, r.y+5))
             
-            # Hover Effect
-            if rect.collidepoint(mx, my) and not is_incoming and not is_connected:
-                col = BTN_HOVER
-
-            pygame.draw.rect(screen, col, rect)
-            pygame.draw.rect(screen, COLOR_MARCO, rect, 1)
+            label = "LINKED" if is_conn else ("ACCEPT" if is_in else ("SECURE" if is_verif else "CALL"))
+            s_lbl = font.render(label, True, (0,0,0) if is_in or is_verif else COLOR_MARCO)
+            screen.blit(s_lbl, (r.right - s_lbl.get_width()-5, r.y+5))
             
-            # Texto Nombre
-            lbl_name = f"{d['name'][:9]}"
-            screen.blit(font.render(lbl_name, True, COLOR_TEXTO), (rect.x+5, rect.y+5))
-            
-            # Texto Estado (Derecha)
-            lbl_stat = font.render(label, True, (0,0,0) if is_incoming or is_verif else COLOR_MARCO)
-            screen.blit(lbl_stat, (rect.right - lbl_stat.get_width() - 5, rect.y+5))
-            
-            # Guardamos botón para detectar clic luego
-            self.active_buttons.append((rect, pid))
+            self.active_buttons.append((r, pid))
             y_btn += 35
 
-        # --- CHAT ---
         pygame.draw.rect(screen, (0,20,0), chat); pygame.draw.rect(screen, COLOR_MARCO, chat, 3)
         screen.set_clip(chat)
         y = chat.bottom - 40
@@ -463,34 +388,27 @@ class CodecDisplay:
                 if y < chat.top: break
             if y < chat.top: break
         screen.set_clip(None)
-
-        # Input
         screen.blit(font.render(f"> {STATE.input_text}_", True, COLOR_TEXTO_YO), (chat.x+10, chat.bottom - 30))
 
     def _draw_face(self, screen, name, x, y):
         clean_name = name.split(" [")[0].lower()
-        frames = CHARS.get_frames(clean_name)
+        frames = CHARS.get(clean_name)
         idx = (pygame.time.get_ticks()//100) % len(frames) if STATE.is_talking(clean_name) else 0
         screen.blit(frames[idx], (x, y))
 
-# ==========================================
-# 5. BUCLE PRINCIPAL (GESTIÓN DE CLICS)
-# ==========================================
 async def main():
     if len(sys.argv) > 1: name = sys.argv[1]
-    else: name = input("Nombre de Agente: ")
+    else: name = input("Nombre: ")
     STATE.my_name = name
     
     client = ChatClient(name)
-    
-    # 1. PEDIR PIN ANTES DE ABRIR VENTANA
-    client.iniciar_dnie_antes_de_gui()
+    if not client.iniciar_dnie_antes_de_gui(): return
 
     await client.start()
 
     pygame.init()
     screen = pygame.display.set_mode((ANCHO, ALTO))
-    pygame.display.set_caption("MGS CODEC - DNIe SECURE")
+    pygame.display.set_caption("MGS CODEC")
     
     global CHARS
     CHARS = CodecCharacterLoader()
@@ -503,34 +421,17 @@ async def main():
     while running:
         for e in pygame.event.get():
             if e.type == pygame.QUIT: running = False
-            
-            # ESCRIBIR
             if e.type == pygame.KEYDOWN:
                 if e.key == pygame.K_RETURN:
                     if STATE.input_text: client.process_command(STATE.input_text)
                     STATE.input_text = ""
                 elif e.key == pygame.K_BACKSPACE: STATE.input_text = STATE.input_text[:-1]
                 else: STATE.input_text += e.unicode
-            
-            # --- GESTIÓN DE CLICS EN BOTONES ---
             if e.type == pygame.MOUSEBUTTONDOWN:
-                if e.button == 1: # Clic Izquierdo
-                    for rect, pid in gui.active_buttons:
-                        if rect.collidepoint(e.pos):
-                            # LÓGICA DE CLIC INTELIGENTE
-                            
-                            # A) Si nos están llamando (Está en la lista de incoming) -> ACEPTAR
-                            if pid in STATE.incoming_ids:
-                                client.accept_connection(pid)
-                            
-                            # B) Si no estamos conectados con él -> LLAMAR
-                            else:
-                                peer_ip = client.peers[pid]['ip']
-                                peer_name = client.peers[pid]['name']
-                                
-                                # Solo llamar si no estamos ya conectados a esa IP
-                                if client.target_ip != peer_ip:
-                                    client.connect_manual(peer_ip, peer_name)
+                for r, pid in gui.active_buttons:
+                    if r.collidepoint(e.pos):
+                        if pid in STATE.incoming_ids: client.accept_connection(pid)
+                        else: client.connect_manual(client.peers[pid]['ip'], client.peers[pid]['name'])
 
         gui.update()
         gui.draw(screen, font, font_ui, client)
