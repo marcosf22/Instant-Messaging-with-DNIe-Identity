@@ -6,7 +6,7 @@ from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZerocon
 
 # Configuración del documento
 SERVICE_TYPE = "_dni-im._udp.local."
-CHAT_PORT = 8888
+CHAT_PORT = 9999
 
 logger = logging.getLogger("Discovery")
 
