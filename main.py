@@ -25,22 +25,23 @@ class ChatClient:
         self.name = name
         self.loop = asyncio.get_running_loop()
         self.my_ip = get_ip()
-        self.broadcast = "255.255.255.255"
         
-        # Crypto
+        # Guardamos la clave pública del otro para verificarla después
+        self.peer_static_keys = {} 
+
         try: self.km = KeyManager(f"{name}_identity")
-        except Exception as e: print(f"❌ Error Crypto: {e}"); sys.exit(1)
+        except: sys.exit(1)
 
         self.sessions = {}        
         self.peers = {}           
         self.target_ip = None     
         self.pending = {} 
-        self.verified_users = {} # Lista de usuarios DNIe verificados
+        self.verified_users = {}
 
         self.proto = ChatProtocol(self.on_packet)
         self.load_sessions()
 
-    # --- DISCO ---
+    # ... (Funciones de Persistencia load_sessions / save_sessions igual que antes) ...
     def load_sessions(self):
         if not os.path.exists(SESSION_FILE): return
         try:
@@ -49,17 +50,43 @@ class ChatClient:
                 s = SessionCrypto(None); s.load_secret(hx)
                 self.sessions[ip] = s
         except: pass
-
+    
     def save_sessions(self):
         d = {ip: s.export_secret() for ip, s in self.sessions.items() if s.export_secret()}
-        try:
-            with open(SESSION_FILE,'w') as f: json.dump(d, f)
+        try: with open(SESSION_FILE,'w') as f: json.dump(d, f)
         except: pass
+
+    # --- VERIFICACIÓN DNIe (CORREGIDA) ---
+    def send_verification(self):
+        if not self.target_ip: return print("⛔ Conecta primero.")
+        
+        print("\n💳 GENERANDO FIRMA DIGITAL DE TU CLAVE DE CHAT...")
+        # Esto pedirá el PIN localmente, firmará tu clave y devolverá la firma
+        cert_der, firma = self.km.generar_paquete_verificacion()
+        
+        if not cert_der or not firma:
+            print("❌ Cancelado.")
+            return
+
+        # Empaquetamos: [LenCert(4) + Cert + LenFirma(4) + Firma]
+        # NO ENVIAMOS LA CLAVE PÚBLICA, PORQUE EL OTRO YA LA TIENE DEL HANDSHAKE
+        payload = struct.pack("!I", len(cert_der)) + cert_der + \
+                  struct.pack("!I", len(firma)) + firma
+        
+        # Encriptamos el paquete de autenticación para privacidad
+        try:
+            session = self.sessions[self.target_ip]
+            # Codificamos a latin1 para preservar bytes tras encriptar
+            encrypted_payload = session.encrypt(payload.decode('latin1')) 
+            self.proto.send_packet(self.target_ip, PORT, MSG_AUTH, 0, encrypted_payload)
+            print("📤 Firma enviada. El otro usuario comprobará tu identidad.")
+        except Exception as e:
+            print(f"❌ Error enviando: {e}")
 
     # --- RED ---
     async def start(self):
         print(f"--- CHAT EN {self.my_ip}:{PORT} ---")
-        self.trans, _ = await self.loop.create_datagram_endpoint(
+        self.transport, _ = await self.loop.create_datagram_endpoint(
             lambda: self.proto, local_addr=("0.0.0.0", PORT), allow_broadcast=True
         )
         self.loop.create_task(self.beacon())
@@ -67,39 +94,13 @@ class ChatClient:
     async def beacon(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        try: s.bind((self.my_ip,0))
+        try: s.bind((self.my_ip, 0))
         except: pass
         msg = f"DISCOVERY:{self.name}".encode()
         while True:
-            try: s.sendto(msg, (self.broadcast, PORT))
+            try: s.sendto(msg, ("255.255.255.255", PORT))
             except: pass
             await asyncio.sleep(3)
-
-    # --- VERIFICACIÓN DNIe ---
-    def send_verification(self):
-        """Pide PIN, firma y envía credenciales"""
-        if not self.target_ip: return print("⛔ Conecta primero.")
-        print("\n💳 Preparando DNIe (Te pedirá el PIN)...")
-        try:
-            # 1. Firmar
-            pub_k, cert, sig = self.km.get_my_identity_pack()
-            
-            # 2. Empaquetar: [LenCert(4) + Cert + LenSig(4) + Sig + Key(32)]
-            payload = struct.pack("!I", len(cert)) + cert + \
-                      struct.pack("!I", len(sig)) + sig + \
-                      pub_k
-            
-            # 3. Encriptar y Enviar como MSG_AUTH
-            # IMPORTANTE: Encriptamos el paquete de auth para que nadie robe la firma en tránsito
-            session = self.sessions[self.target_ip]
-            encrypted_payload = session.encrypt(payload.decode('latin1')) # Hack para encryptar bytes raw
-            
-            # Enviamos como MSG_AUTH
-            self.proto.send_packet(self.target_ip, PORT, MSG_AUTH, 0, encrypted_payload)
-            print("📤 Credenciales enviadas. Esperando validación del otro...")
-            
-        except Exception as e:
-            print(f"❌ Error DNIe: {e}")
 
     # --- PACKETS ---
     def on_packet(self, pkt, addr):
@@ -107,70 +108,81 @@ class ChatClient:
         if ip == self.my_ip: return
 
         if pkt.msg_type == MSG_DISCOVERY:
-            name = pkt.payload
             if ip not in [p['ip'] for p in self.peers.values()]:
-                self.peers[len(self.peers)] = {'ip': ip, 'name': name}
-                if not self.target_ip: print(f"\n🔭 Nuevo: {name} ({ip})")
+                self.peers[len(self.peers)] = {'ip': ip, 'name': pkt.payload}
 
         elif pkt.msg_type == MSG_HELLO:
-            if ip not in self.sessions:
-                if ip not in self.pending:
-                    self.pending[ip] = pkt.payload
-                    print(f"\n🔔 Solicitud de {ip}. (/accept ID)")
-            else:
-                self.sessions[ip].perform_handshake(pkt.payload)
+            # GUARDAMOS SU CLAVE PÚBLICA PARA VERIFICARLA LUEGO
+            self.peer_static_keys[ip] = pkt.payload
+
+            if ip in self.sessions:
+                try: self.sessions[ip].perform_handshake(pkt.payload)
+                except: pass
+            elif ip not in self.pending:
+                self.pending[ip] = pkt.payload
+                print(f"\n🔔 Solicitud de {ip}. (/accept ID)")
+
+        elif pkt.msg_type == MSG_AUTH:
+            if ip in self.sessions:
+                print(f"\n🕵️ Verificando firma digital de {ip}...")
+                try:
+                    # 1. Desencriptar
+                    decrypted = self.sessions[ip].decrypt(pkt.payload).encode('latin1')
+                    
+                    # 2. Desempaquetar
+                    offset = 0
+                    l_c = struct.unpack("!I", decrypted[offset:offset+4])[0]; offset+=4
+                    cert = decrypted[offset:offset+l_c]; offset+=l_c
+                    l_s = struct.unpack("!I", decrypted[offset:offset+4])[0]; offset+=4
+                    firma = decrypted[offset:offset+l_s]
+                    
+                    # 3. VERIFICAR LA FIRMA CONTRA LA CLAVE DEL CHAT
+                    # Recuperamos la clave pública que nos envió en el Handshake (HELLO)
+                    clave_chat_usuario = self.peer_static_keys.get(ip)
+                    
+                    if not clave_chat_usuario:
+                        print("❌ Error: No tengo la clave de chat original para verificar.")
+                        return
+
+                    valido, nombre_real = self.km.verificar_identidad_del_otro(
+                        clave_chat_usuario, cert, firma
+                    )
+                    
+                    if valido:
+                        print(f"✅ DNIe VERIFICADO CORRECTAMENTE.")
+                        print(f"   La persona usando este chat es realmente: {nombre_real}")
+                        self.verified_users[ip] = nombre_real
+                    else:
+                        print(f"❌ ALERTA ROJA: La firma NO coincide. Identidad falsa o error.")
+                        print(f"   Error: {nombre_real}")
+
+                except Exception as e: print(f"❌ Error Auth: {e}")
 
         elif pkt.msg_type == MSG_DATA:
             if ip in self.sessions:
                 try:
                     msg = self.sessions[ip].decrypt(pkt.payload)
-                    name = self.verified_users.get(ip, ip) # Usar nombre real si existe
+                    name = self.verified_users.get(ip, ip) # Mostrar nombre real si verificado
                     print(f"\r[{name}]: {msg}\nTú > ", end="")
                 except: 
-                    print("\n♻️ Renegociando..."); del self.sessions[ip]; self.connect(ip)
-        
-        elif pkt.msg_type == MSG_AUTH:
-            if ip in self.sessions:
-                print(f"\n🕵️ Recibiendo documentación de {ip}...")
-                try:
-                    # 1. Desencriptar
-                    # (Usamos decode latin1 para recuperar los bytes originales tras desencriptar)
-                    decrypted_str = self.sessions[ip].decrypt(pkt.payload)
-                    raw_data = decrypted_str.encode('latin1')
-                    
-                    # 2. Desempaquetar
-                    offset = 0
-                    l_cert = struct.unpack("!I", raw_data[offset:offset+4])[0]; offset+=4
-                    cert = raw_data[offset:offset+l_cert]; offset+=l_cert
-                    l_sig = struct.unpack("!I", raw_data[offset:offset+4])[0]; offset+=4
-                    sig = raw_data[offset:offset+l_sig]; offset+=l_sig
-                    pub_k = raw_data[offset:]
-                    
-                    # 3. VERIFICAR
-                    valid, cn = self.km.verify_peer_identity(pub_k, cert, sig)
-                    
-                    if valid:
-                        print(f"✅ IDENTIDAD VERIFICADA: {cn}")
-                        print(f"   (El DNIe confirma que esta persona es real)")
-                        self.verified_users[ip] = f"{cn} (Verificado)"
-                    else:
-                        print(f"❌ ALERTA: FIRMA INVÁLIDA. {cn}")
-                except Exception as e:
-                    print(f"❌ Error procesando Auth: {e}")
+                     print("\n♻️ Renegociando..."); del self.sessions[ip]; self.connect(ip)
 
-    # --- ACTIONS ---
+    # --- ACCIONES ---
     def connect(self, ip):
         s = SessionCrypto(None)
         self.sessions[ip] = s
-        for _ in range(3): 
-            self.proto.send_packet(ip, PORT, MSG_HELLO, 0, s.get_ephemeral_public_bytes())
+        mk = s.get_ephemeral_public_bytes()
+        # Guardamos nuestra propia clave para referencias futuras si fuera necesario
+        for _ in range(3): self.proto.send_packet(ip, PORT, MSG_HELLO, 0, mk)
         self.target_ip = ip
 
     def accept(self, pid):
-        if pid not in self.peers: return
         ip = self.peers[pid]['ip']
         if ip in self.pending:
-            self.connect(ip) # Inicia handshake reverso
+            # Guardamos su clave pública antes de borrar pending
+            self.peer_static_keys[ip] = self.pending[ip]
+            
+            self.connect(ip)
             self.sessions[ip].perform_handshake(self.pending[ip])
             del self.pending[ip]
             self.save_sessions()
@@ -185,8 +197,8 @@ async def main():
     q = queue.Queue()
     threading.Thread(target=lambda: [q.put(sys.stdin.readline().strip()) for _ in iter(int,1)], daemon=True).start()
 
-    print("--- LISTO ---")
-    print("Comandos: /connect ID, /accept ID, /verify (Envia tu DNIe)")
+    print("--- LISTO (VERIFICACIÓN SEGURA) ---")
+    c.show_peers = lambda: [print(f"{k}: {v['name']} ({v['ip']})") for k,v in c.peers.items()]
     c.load_sessions()
     print("(Lobby) > ", end="")
 
@@ -201,8 +213,7 @@ async def main():
             elif msg.startswith("/accept"):
                 try: c.accept(int(msg.split()[1]))
                 except: print("ID Mal")
-            elif msg == "/list": 
-                for k,v in c.peers.items(): print(f"{k}: {v['name']} - {v['ip']}")
+            elif msg == "/list": c.show_peers()
             else:
                 if c.target_ip:
                     enc = c.sessions[c.target_ip].encrypt(msg)
