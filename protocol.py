@@ -1,11 +1,9 @@
 import asyncio
 import struct
 
-# Tipos de mensaje
-MSG_HELLO = 1      # Handshake
-MSG_DATA = 2       # Chat
-MSG_DISCOVERY = 99 # Discovery
-MSG_AUTH = 3       # <--- NUEVO: Paquete de Verificación DNIe
+MSG_HELLO = 1      # Ahora llevará Certificado + Firma + Clave
+MSG_DATA = 2
+MSG_DISCOVERY = 99
 
 class ChatPacket:
     def __init__(self, msg_type, seq, payload):
@@ -22,7 +20,6 @@ class ChatProtocol(asyncio.DatagramProtocol):
         self.transport = transport
 
     def datagram_received(self, data, addr):
-        # 1. Discovery
         if data.startswith(b"DISCOVERY:"):
             try:
                 nombre = data.decode('utf-8').split(":")[1]
@@ -30,7 +27,6 @@ class ChatProtocol(asyncio.DatagramProtocol):
                 return
             except: pass
 
-        # 2. Binario
         try:
             if len(data) < 5: return 
             header = data[:5]
