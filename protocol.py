@@ -1,11 +1,14 @@
 import asyncio
 import struct
 
-MSG_HELLO = 1      # Ahora llevará Certificado + Firma + Clave
-MSG_DATA = 2
-MSG_DISCOVERY = 99
+# --- CONSTANTES DE TIPOS DE MENSAJE ---
+MSG_HELLO = 1      # Handshake (Intercambio de claves inicial)
+MSG_DATA = 2       # Mensaje de texto encriptado
+MSG_AUTH = 3       # Verificación de Identidad (Paquete DNIe)
+MSG_DISCOVERY = 99 # Señal de descubrimiento (Broadcast)
 
 class ChatPacket:
+    """Clase contenedora para pasar los datos limpios al Main"""
     def __init__(self, msg_type, seq, payload):
         self.msg_type = msg_type
         self.seq = seq
@@ -20,24 +23,50 @@ class ChatProtocol(asyncio.DatagramProtocol):
         self.transport = transport
 
     def datagram_received(self, data, addr):
+        # 1. FILTRO DE DISCOVERY (Texto Plano)
+        # Los paquetes de discovery suelen ser "DISCOVERY:Nombre" en utf-8 raw
         if data.startswith(b"DISCOVERY:"):
             try:
-                nombre = data.decode('utf-8').split(":")[1]
-                self.on_packet(ChatPacket(MSG_DISCOVERY, 0, nombre), addr)
+                # Extraemos solo el nombre
+                nombre_usuario = data.decode('utf-8', errors='ignore').split(":")[1]
+                fake_packet = ChatPacket(MSG_DISCOVERY, 0, nombre_usuario)
+                self.on_packet(fake_packet, addr)
                 return
-            except: pass
+            except: 
+                pass
 
+        # 2. PROTOCOLO BINARIO ESTÁNDAR
+        # Estructura: [TIPO (1 byte)] + [SECUENCIA (4 bytes)] + [PAYLOAD (Resto)]
         try:
             if len(data) < 5: return 
+            
+            # Desempaquetamos la cabecera (!BI = Network Endian, Unsigned Char, Unsigned Int)
             header = data[:5]
             msg_type, seq = struct.unpack("!BI", header)
+            
+            # El resto es el payload (puede ser json, bytes encriptados, etc)
             payload = data[5:]
-            self.on_packet(ChatPacket(msg_type, seq, payload), addr)
-        except: pass
+            
+            packet = ChatPacket(msg_type, seq, payload)
+            self.on_packet(packet, addr)
+            
+        except Exception:
+            # Si llega basura, la ignoramos para no romper el programa
+            pass
 
     def send_packet(self, ip, port, msg_type, seq, payload):
+        """Empaqueta y envía datos a una IP/Puerto"""
         if self.transport:
+            # Preparamos la cabecera
             header = struct.pack("!BI", msg_type, seq)
-            if isinstance(payload, str): payload = payload.encode()
+            
+            # Aseguramos que el payload sean bytes
+            if isinstance(payload, str):
+                payload = payload.encode('utf-8')
+                
             final_data = header + payload
-            self.transport.sendto(final_data, (ip, port))
+            
+            try:
+                self.transport.sendto(final_data, (ip, port))
+            except Exception as e:
+                print(f"Error de transporte al enviar a {ip}: {e}")
