@@ -5,18 +5,17 @@ import threading
 import queue
 import json
 import os
+import struct
 
 from crypto import KeyManager, SessionCrypto
-from protocol import ChatProtocol, MSG_HELLO, MSG_DATA, MSG_DISCOVERY
+from protocol import ChatProtocol, MSG_HELLO, MSG_DATA, MSG_DISCOVERY, MSG_AUTH
 
 PORT = 8888 
 SESSION_FILE = "sessions.json"
 
-def get_best_ip():
+def get_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(('8.8.8.8', 1)) 
-        IP = s.getsockname()[0]
+    try: s.connect(('8.8.8.8', 1)); IP = s.getsockname()[0]
     except: IP = '127.0.0.1'
     finally: s.close()
     return IP
@@ -25,249 +24,192 @@ class ChatClient:
     def __init__(self, name):
         self.name = name
         self.loop = asyncio.get_running_loop()
-        self.my_ip = get_best_ip()
+        self.my_ip = get_ip()
+        self.broadcast = "255.255.255.255"
         
-        try:
-            parts = self.my_ip.split('.')
-            self.broadcast_addr = f"{parts[0]}.{parts[1]}.{parts[2]}.255"
-        except: self.broadcast_addr = "255.255.255.255"
-
-        print(f"--> Mi IP: {self.my_ip}")
-
-        try:
-            self.key_manager = KeyManager(f"{name}_identity")
-        except Exception as e:
-            print(f"❌ Error crypto: {e}")
-            sys.exit(1)
+        # Crypto
+        try: self.km = KeyManager(f"{name}_identity")
+        except Exception as e: print(f"❌ Error Crypto: {e}"); sys.exit(1)
 
         self.sessions = {}        
         self.peers = {}           
-        self.peer_counter = 0     
         self.target_ip = None     
-        self.pending_requests = {} 
+        self.pending = {} 
+        self.verified_users = {} # Lista de usuarios DNIe verificados
 
-        self.protocol = ChatProtocol(self.on_packet)
-        self.transport = None
-        self.load_sessions_from_disk()
+        self.proto = ChatProtocol(self.on_packet)
+        self.load_sessions()
 
-    # --- PERSISTENCIA ---
-    def load_sessions_from_disk(self):
+    # --- DISCO ---
+    def load_sessions(self):
         if not os.path.exists(SESSION_FILE): return
         try:
-            with open(SESSION_FILE, 'r') as f:
-                saved_data = json.load(f)
-            count = 0
-            for ip, hex_key in saved_data.items():
-                session = SessionCrypto(self.key_manager.static_private)
-                try:
-                    session.load_secret(hex_key)
-                    self.sessions[ip] = session
-                    count += 1
-                except: pass
-            if count > 0: print(f"💾 {count} sesiones recuperadas.")
+            with open(SESSION_FILE,'r') as f: data = json.load(f)
+            for ip, hx in data.items():
+                s = SessionCrypto(None); s.load_secret(hx)
+                self.sessions[ip] = s
         except: pass
 
-    def save_sessions_to_disk(self):
-        data = {}
-        for ip, session in self.sessions.items():
-            k = session.export_secret()
-            if k: data[ip] = k
+    def save_sessions(self):
+        d = {ip: s.export_secret() for ip, s in self.sessions.items() if s.export_secret()}
         try:
-            with open(SESSION_FILE, 'w') as f: json.dump(data, f, indent=4)
+            with open(SESSION_FILE,'w') as f: json.dump(d, f)
         except: pass
 
     # --- RED ---
     async def start(self):
-        print(f"--- CHAT INICIADO EN {PORT} ---")
-        self.transport, _ = await self.loop.create_datagram_endpoint(
-            lambda: self.protocol, local_addr=("0.0.0.0", PORT), allow_broadcast=True
+        print(f"--- CHAT EN {self.my_ip}:{PORT} ---")
+        self.trans, _ = await self.loop.create_datagram_endpoint(
+            lambda: self.proto, local_addr=("0.0.0.0", PORT), allow_broadcast=True
         )
-        self.loop.create_task(self.beacon_loop())
+        self.loop.create_task(self.beacon())
 
-    async def beacon_loop(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        try: sock.bind((self.my_ip, 0))
+    async def beacon(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        try: s.bind((self.my_ip,0))
         except: pass
         msg = f"DISCOVERY:{self.name}".encode()
         while True:
-            try: sock.sendto(msg, (self.broadcast_addr, PORT))
+            try: s.sendto(msg, (self.broadcast, PORT))
             except: pass
             await asyncio.sleep(3)
 
-    # --- UI ---
-    def show_peers(self):
-        print("\n" + "="*30)
-        print(" 👥  CONTACTOS")
-        print("="*30)
-        for pid, d in self.peers.items():
-            status = " [🔐 Guardado]" if d['ip'] in self.sessions else ""
-            print(f"   [{pid}]  {d['name']:<15} {status}")
-        
-        if self.pending_requests:
-            print("-" * 30)
-            for ip in self.pending_requests:
-                name = "Desconocido"
-                pid_s = "?"
-                for pid, d in self.peers.items():
-                    if d['ip'] == ip: 
-                        name, pid_s = d['name'], str(pid)
-                print(f" 🔔 {name} quiere conectar. (/accept {pid_s})")
-        print("="*30)
-
-    def disconnect_current(self):
-        if self.target_ip:
-            print(f"\n🔌 Desconectado de {self.target_ip}.")
-            self.target_ip = None
-        self.show_peers()
-        print("(Lobby) > ", end="", flush=True)
-
-    def accept_connection(self, peer_id):
-        if peer_id not in self.peers: return print("❌ ID incorrecto")
-        ip = self.peers[peer_id]['ip']
-        if ip not in self.pending_requests: return print("⚠️ No hay solicitud.")
-        
-        print(f"✅ Aceptando...")
-        session = SessionCrypto(self.key_manager.static_private)
-        self.sessions[ip] = session
+    # --- VERIFICACIÓN DNIe ---
+    def send_verification(self):
+        """Pide PIN, firma y envía credenciales"""
+        if not self.target_ip: return print("⛔ Conecta primero.")
+        print("\n💳 Preparando DNIe (Te pedirá el PIN)...")
         try:
-            session.perform_handshake(self.pending_requests[ip], True)
-            mk = session.get_ephemeral_public_bytes()
-            for _ in range(3): self.protocol.send_packet(ip, PORT, MSG_HELLO, 0, mk)
+            # 1. Firmar
+            pub_k, cert, sig = self.km.get_my_identity_pack()
             
-            self.target_ip = ip
-            del self.pending_requests[ip]
-            self.save_sessions_to_disk()
-            print(f"\n✨ CONECTADO.")
-            print("Tú > ", end="", flush=True)
-        except Exception as e: print(f"❌ Error: {e}")
+            # 2. Empaquetar: [LenCert(4) + Cert + LenSig(4) + Sig + Key(32)]
+            payload = struct.pack("!I", len(cert)) + cert + \
+                      struct.pack("!I", len(sig)) + sig + \
+                      pub_k
+            
+            # 3. Encriptar y Enviar como MSG_AUTH
+            # IMPORTANTE: Encriptamos el paquete de auth para que nadie robe la firma en tránsito
+            session = self.sessions[self.target_ip]
+            encrypted_payload = session.encrypt(payload.decode('latin1')) # Hack para encryptar bytes raw
+            
+            # Enviamos como MSG_AUTH
+            self.proto.send_packet(self.target_ip, PORT, MSG_AUTH, 0, encrypted_payload)
+            print("📤 Credenciales enviadas. Esperando validación del otro...")
+            
+        except Exception as e:
+            print(f"❌ Error DNIe: {e}")
 
     # --- PACKETS ---
-    def on_packet(self, packet, addr):
+    def on_packet(self, pkt, addr):
         ip = addr[0]
-        if ip == self.my_ip: return 
+        if ip == self.my_ip: return
 
-        if packet.msg_type == MSG_DISCOVERY:
-            name = packet.payload
+        if pkt.msg_type == MSG_DISCOVERY:
+            name = pkt.payload
             if ip not in [p['ip'] for p in self.peers.values()]:
-                 pid = self.peer_counter
-                 self.peers[pid] = {'ip': ip, 'port': PORT, 'name': name}
-                 self.peer_counter += 1
-                 if self.target_ip is None:
-                     print(f"\n🔭 Nuevo contacto: [{pid}] {name}")
-                     print("(Lobby) > ", end="", flush=True)
+                self.peers[len(self.peers)] = {'ip': ip, 'name': name}
+                if not self.target_ip: print(f"\n🔭 Nuevo: {name} ({ip})")
 
-        elif packet.msg_type == MSG_HELLO:
-            if ip in self.sessions:
-                try:
-                    self.sessions[ip].perform_handshake(packet.payload, True)
-                    self.save_sessions_to_disk()
-                    print(f"\n✅ CONEXIÓN COMPLETADA CON {ip}")
-                    print("Tú > ", end="", flush=True)
-                except: pass
-                return
-
-            if ip not in self.pending_requests:
-                self.pending_requests[ip] = packet.payload
-                # Avisar
-                name, pid_s = ip, "?"
-                for pid, d in self.peers.items():
-                    if d['ip'] == ip: name, pid_s = d['name'], pid
-                print(f"\n🔔 Solicitud de {name}. (/accept {pid_s})")
-                print("Tú > " if self.target_ip else "(Lobby) > ", end="", flush=True)
-
-        elif packet.msg_type == MSG_DATA:
-            if ip in self.sessions:
-                try:
-                    msg = self.sessions[ip].decrypt(packet.payload)
-                    name = ip
-                    for p in self.peers.values():
-                        if p['ip'] == ip: name = p['name']
-                    sys.stdout.write("\r\033[K")
-                    print(f"[{name}]: {msg}")
-                    print("Tú > " if self.target_ip == ip else "(Lobby) > ", end="", flush=True)
-                except:
-                    print(f"\n♻️ Clave vieja falló. Renegociando...")
-                    del self.sessions[ip]
-                    self.save_sessions_to_disk()
-                    self.connect_manual(ip)
+        elif pkt.msg_type == MSG_HELLO:
+            if ip not in self.sessions:
+                if ip not in self.pending:
+                    self.pending[ip] = pkt.payload
+                    print(f"\n🔔 Solicitud de {ip}. (/accept ID)")
             else:
-                print(f"\n⚠️ Mensaje ilegible. Reconectando...")
-                self.connect_manual(ip)
+                self.sessions[ip].perform_handshake(pkt.payload)
 
-    def connect_manual(self, ip_target):
-        if ip_target in self.sessions:
-            self.target_ip = ip_target
-            print("✅ Usando clave guardada. Chat listo.")
-            return
+        elif pkt.msg_type == MSG_DATA:
+            if ip in self.sessions:
+                try:
+                    msg = self.sessions[ip].decrypt(pkt.payload)
+                    name = self.verified_users.get(ip, ip) # Usar nombre real si existe
+                    print(f"\r[{name}]: {msg}\nTú > ", end="")
+                except: 
+                    print("\n♻️ Renegociando..."); del self.sessions[ip]; self.connect(ip)
+        
+        elif pkt.msg_type == MSG_AUTH:
+            if ip in self.sessions:
+                print(f"\n🕵️ Recibiendo documentación de {ip}...")
+                try:
+                    # 1. Desencriptar
+                    # (Usamos decode latin1 para recuperar los bytes originales tras desencriptar)
+                    decrypted_str = self.sessions[ip].decrypt(pkt.payload)
+                    raw_data = decrypted_str.encode('latin1')
+                    
+                    # 2. Desempaquetar
+                    offset = 0
+                    l_cert = struct.unpack("!I", raw_data[offset:offset+4])[0]; offset+=4
+                    cert = raw_data[offset:offset+l_cert]; offset+=l_cert
+                    l_sig = struct.unpack("!I", raw_data[offset:offset+4])[0]; offset+=4
+                    sig = raw_data[offset:offset+l_sig]; offset+=l_sig
+                    pub_k = raw_data[offset:]
+                    
+                    # 3. VERIFICAR
+                    valid, cn = self.km.verify_peer_identity(pub_k, cert, sig)
+                    
+                    if valid:
+                        print(f"✅ IDENTIDAD VERIFICADA: {cn}")
+                        print(f"   (El DNIe confirma que esta persona es real)")
+                        self.verified_users[ip] = f"{cn} (Verificado)"
+                    else:
+                        print(f"❌ ALERTA: FIRMA INVÁLIDA. {cn}")
+                except Exception as e:
+                    print(f"❌ Error procesando Auth: {e}")
 
-        print(f"--> Enviando solicitud a {ip_target}...")
-        session = SessionCrypto(self.key_manager.static_private)
-        self.sessions[ip_target] = session
-        try:
-            mk = session.get_ephemeral_public_bytes()
-            for _ in range(3): self.protocol.send_packet(ip_target, PORT, MSG_HELLO, 0, mk)
-            self.target_ip = ip_target
-            print("⏳ Esperando respuesta...")
-        except: del self.sessions[ip_target]
+    # --- ACTIONS ---
+    def connect(self, ip):
+        s = SessionCrypto(None)
+        self.sessions[ip] = s
+        for _ in range(3): 
+            self.proto.send_packet(ip, PORT, MSG_HELLO, 0, s.get_ephemeral_public_bytes())
+        self.target_ip = ip
 
-    def send_chat(self, text):
-        if self.target_ip and self.target_ip in self.sessions:
-            try:
-                enc = self.sessions[self.target_ip].encrypt(text)
-                self.protocol.send_packet(self.target_ip, PORT, MSG_DATA, 1, enc)
-            except: pass
-        else: print("⛔ No conectado.")
+    def accept(self, pid):
+        if pid not in self.peers: return
+        ip = self.peers[pid]['ip']
+        if ip in self.pending:
+            self.connect(ip) # Inicia handshake reverso
+            self.sessions[ip].perform_handshake(self.pending[ip])
+            del self.pending[ip]
+            self.save_sessions()
+            print("✅ Conectado.")
 
+# --- MAIN ---
 async def main():
-    name = sys.argv[1] if len(sys.argv) > 1 else input("Tu nombre: ")
-    client = ChatClient(name)
-    await client.start()
+    name = sys.argv[1] if len(sys.argv)>1 else input("Nombre: ")
+    c = ChatClient(name)
+    await c.start()
+    
+    q = queue.Queue()
+    threading.Thread(target=lambda: [q.put(sys.stdin.readline().strip()) for _ in iter(int,1)], daemon=True).start()
 
-    input_queue = queue.Queue()
-    def kbd():
-        while True:
-            try:
-                l = sys.stdin.readline()
-                if l: input_queue.put(l.strip())
-            except: break
-    threading.Thread(target=kbd, daemon=True).start()
-
-    print("\n--- SISTEMA LISTO ---")
-    client.show_peers()
-    print("(Lobby) > ", end="", flush=True)
+    print("--- LISTO ---")
+    print("Comandos: /connect ID, /accept ID, /verify (Envia tu DNIe)")
+    c.load_sessions()
+    print("(Lobby) > ", end="")
 
     while True:
-        while not input_queue.empty():
-            msg = input_queue.get_nowait()
-            if msg == "/quit": 
-                client.save_sessions_to_disk()
-                return
-            elif msg == "/leave": client.disconnect_current()
-            elif msg.startswith("/connect"):
-                parts = msg.split()
-                if len(parts) > 1 and parts[1].isdigit():
-                    pid = int(parts[1])
-                    if pid in client.peers: client.connect_manual(client.peers[pid]['ip'])
-                    else: print("❌ ID incorrecto")
+        while not q.empty():
+            msg = q.get()
+            if msg == "/quit": c.save_sessions(); return
+            if msg == "/verify": c.send_verification()
+            elif msg.startswith("/connect"): 
+                try: c.connect(c.peers[int(msg.split()[1])]['ip'])
+                except: print("ID Mal")
             elif msg.startswith("/accept"):
-                parts = msg.split()
-                if len(parts) > 1 and parts[1].isdigit(): client.accept_connection(int(parts[1]))
-            elif msg == "/list":
-                 client.show_peers()
-                 print("Tú > " if client.target_ip else "(Lobby) > ", end="", flush=True)
+                try: c.accept(int(msg.split()[1]))
+                except: print("ID Mal")
+            elif msg == "/list": 
+                for k,v in c.peers.items(): print(f"{k}: {v['name']} - {v['ip']}")
             else:
-                if client.target_ip:
-                    client.send_chat(msg)
-                    print("Tú > ", end="", flush=True)
-                else:
-                    if msg.strip(): 
-                        print("⛔ Lobby: Usa /connect <ID>")
-                        print("(Lobby) > ", end="", flush=True)
+                if c.target_ip:
+                    enc = c.sessions[c.target_ip].encrypt(msg)
+                    c.proto.send_packet(c.target_ip, PORT, MSG_DATA, 0, enc)
+                    print("Tú > ", end="")
         await asyncio.sleep(0.1)
 
 if __name__ == "__main__":
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     try: asyncio.run(main())
-    except KeyboardInterrupt: pass
+    except: pass
