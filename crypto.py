@@ -4,144 +4,90 @@ import time
 import json
 import getpass
 
+# Criptografía
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import x25519, padding
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 # DNIe
 import PyKCS11
 from smartcard.System import readers
 
-# --- AJUSTA TU RUTA DLL AQUÍ ---
+# --- RUTA DE TU DRIVER (Ajusta esto) ---
 DLL_PATH = r"C:\Program Files\OpenSC Project\OpenSC\pkcs11\opensc-pkcs11.dll"
-# DLL_PATH = r"C:\Windows\System32\DNIe_P11_priv.dll"
 
-# --- Parte DNIe (Igual que antes) ---
+# --- GESTOR DEL DNIe (Hardware) ---
 class DNIeHandler:
     def __init__(self):
         self.pkcs11 = PyKCS11.PyKCS11Lib()
-        try:
-            self.lib = self.pkcs11.load(DLL_PATH)
-        except Exception as e:
-            print(f"❌ Error cargando DLL ({DLL_PATH}): {e}")
-            sys.exit(1)
+        try: self.lib = self.pkcs11.load(DLL_PATH)
+        except: print("❌ Error cargando DLL DNIe"); sys.exit(1)
         self.session = None
-        self.slot = None
 
-    def wait_for_card(self):
-        print("⌛ Buscando lector y tarjeta...", end="", flush=True)
-        # Intentamos hasta 10 veces para no bloquear eternamente
-        intentos = 0
-        while intentos < 20:
+    def login_y_firmar(self, datos_a_firmar):
+        """
+        1. Pide el PIN (LOCALMENTE).
+        2. Lo envía a la tarjeta.
+        3. La tarjeta firma los datos DENTRO DEL CHIP.
+        4. Devuelve SOLO LA FIRMA y el CERTIFICADO PÚBLICO.
+        ¡EL PIN SE DESTRUYE AQUÍ Y NO SALE!
+        """
+        print("⌛ Buscando lector DNIe...")
+        while True:
             try:
-                # tokenPresent=True es clave para no listar lectores vacíos
-                slots = self.pkcs11.getSlotList(tokenPresent=True)
-                if slots:
-                    self.slot = slots[0]
-                    print(" [Detectada]")
-                    return True
-            except:
-                pass
-            
-            print(".", end="", flush=True)
-            time.sleep(1)
-            intentos += 1
-        
-        print("\n❌ Tiempo de espera agotado. ¿Está el DNIe bien insertado?")
-        return False
-
-    def login(self):
-        # 1. Asegurar que hay tarjeta
-        if not self.wait_for_card():
-            raise Exception("No se detectó tarjeta")
-
-        # 2. Intentamos limpiar sesiones previas bloqueadas
-        try:
-            self.session = self.pkcs11.openSession(self.slot)
-            self.session.logout()
-            self.session.closeSession()
-        except: pass # Si falla no pasa nada, era por limpiar
-
-        # 3. Abrir sesión limpia
-        try:
-            self.session = self.pkcs11.openSession(self.slot)
-        except Exception as e:
-            raise Exception(f"No se pudo abrir sesión con el chip: {e}")
-
-        # 4. PEDIR PIN (Con cuidado)
-        # A veces el driver oficial saca un popup. OpenSC pide por consola.
-        print("\n" + "-"*40)
-        print("🔐 SEGURIDAD DNIe")
-        print("   Si sale una ventana emergente, pon el PIN ahí.")
-        print("   Si no sale nada, escríbelo aquí abajo.")
-        print("-" * 40)
-        sys.stdout.flush() # Obligar a mostrar el texto
-
-        # Intentamos login nulo primero (algunos drivers lo requieren para sacar el popup)
-        try:
-            self.session.login(None) 
-            print("✅ Login automático (Popup detectado).")
-            return
-        except:
-            # Si falla el nulo, es que necesitamos meter el PIN manual
-            pass
-
-        # Login Manual
-        pwd = getpass.getpass("👉 Introduce el PIN aquí: ")
-        try:
-            self.session.login(pwd)
-            print("✅ PIN Correcto.")
-        except Exception as e:
-            print(f"❌ Error de PIN: {e}")
-            # Importante: cerrar sesión si falla para no bloquear el DNI
-            self.logout()
-            raise e
-
-    def logout(self):
-        if self.session:
-            try:
-                self.session.logout()
-                self.session.closeSession()
+                if self.pkcs11.getSlotList(tokenPresent=True): break
             except: pass
-            self.session = None
-
-    # (El resto de métodos find_auth_certificate y find_private_key déjalos igual...)
-    def find_auth_cert_and_sign(self, data_to_sign):
-        # Copia aquí el contenido de la función find_auth_cert_and_sign que te pasé
-        # en el mensaje anterior ("Dame el codigo completo de ambos programas").
-        # Es vital que esa función esté dentro de esta clase.
-        # ... (código anterior) ...
-        # (Si no lo tienes a mano dímelo y te lo repego, pero es largo)
+            time.sleep(1)
         
-        # --- REPEGO LA LÓGICA DE FIRMA AQUÍ PARA QUE NO FALTE ---
-        objs = self.session.findObjects([(PyKCS11.CKA_CLASS, PyKCS11.CKO_CERTIFICATE)])
-        cert_der = None
-        for obj in objs:
-            try:
+        # --- AQUÍ PEDIMOS EL PIN (LOCAL) ---
+        pin_local = getpass.getpass("👉 Introduce PIN DNIe para firmar: ")
+        
+        try:
+            slot = self.pkcs11.getSlotList(tokenPresent=True)[0]
+            self.session = self.pkcs11.openSession(slot)
+            self.session.login(pin_local) # Se envía al chip, no a la red
+            del pin_local # Borramos el PIN de la memoria RAM inmediatamente
+            print("✅ Chip desbloqueado. Firmando...")
+        except Exception as e:
+            print(f"❌ PIN Incorrecto: {e}"); return None, None
+
+        # --- BUSCAR CERTIFICADO Y FIRMAR ---
+        try:
+            # 1. Buscar Certificado de Firma/Autenticación
+            objs = self.session.findObjects([(PyKCS11.CKA_CLASS, PyKCS11.CKO_CERTIFICATE)])
+            cert_der = None
+            for obj in objs:
                 val = self.session.getAttributeValue(obj, [PyKCS11.CKA_VALUE], True)
                 if val:
-                    tmp_cert = bytes(val[0])
-                    c = x509.load_der_x509_certificate(tmp_cert, default_backend())
-                    subj = c.subject.rfc4514_string().upper()
-                    if "AUTENTICA" in subj or "FIRMA" in subj:
-                        cert_der = tmp_cert
-                        break
-            except: continue
+                    raw_cert = bytes(val[0])
+                    x509_cert = x509.load_der_x509_certificate(raw_cert, default_backend())
+                    # Usamos el de firma o autenticación
+                    if "AUTENTICA" in x509_cert.subject.rfc4514_string().upper():
+                        cert_der = raw_cert; break
             
-        keys = self.session.findObjects([(PyKCS11.CKA_CLASS, PyKCS11.CKO_PRIVATE_KEY)])
-        priv_key = None
-        for k in keys:
-            label = self.session.getAttributeValue(k, [PyKCS11.CKA_LABEL])
-            if label and label[0] == "KprivAutenticacion":
-                priv_key = k; break
-        if not priv_key and keys: priv_key = keys[0]
-        
-        mech = PyKCS11.Mechanism(PyKCS11.CKM_SHA256_RSA_PKCS, None)
-        signature = bytes(self.session.sign(priv_key, data_to_sign, mech))
-        return cert_der, signature
+            # 2. Buscar Clave Privada (Dentro del chip)
+            keys = self.session.findObjects([(PyKCS11.CKA_CLASS, PyKCS11.CKO_PRIVATE_KEY)])
+            priv_key = keys[0] # Simplificación: cogemos la primera llave privada disponible
+            
+            # 3. FIRMAR EL PAQUETE (Handshake Key)
+            mech = PyKCS11.Mechanism(PyKCS11.CKM_SHA256_RSA_PKCS, None)
+            
+            # ¡ESTO ES LO QUE SE ENVÍA! LA FIRMA MATEMÁTICA
+            firma_digital = bytes(self.session.sign(priv_key, datos_a_firmar, mech))
+            
+            self.session.logout()
+            self.session.closeSession()
+            
+            return cert_der, firma_digital
+            
+        except Exception as e:
+            print(f"❌ Error al firmar: {e}")
+            return None, None
 
-# --- GESTOR DE CLAVES ---
+# --- GESTOR DE IDENTIDAD (X25519) ---
 class KeyManager:
     def __init__(self, prefix="identity"):
         self.key_file = f"{prefix}_x25519.json"
@@ -151,75 +97,79 @@ class KeyManager:
 
     def _load_keys(self):
         if os.path.exists(self.key_file):
-            try:
-                with open(self.key_file, 'r') as f:
-                    d = json.load(f)
-                    self.static_private = x25519.X25519PrivateKey.from_private_bytes(bytes.fromhex(d['priv']))
-            except: self._gen_keys()
-        else: self._gen_keys()
+            with open(self.key_file, 'r') as f:
+                d = json.load(f)
+                self.static_private = x25519.X25519PrivateKey.from_private_bytes(bytes.fromhex(d['priv']))
+        else:
+            self.static_private = x25519.X25519PrivateKey.generate()
+            with open(self.key_file, 'w') as f:
+                json.dump({'priv': self.static_private.private_bytes(
+                    serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption()
+                ).hex()}, f)
         self.static_public = self.static_private.public_key()
 
-    def _gen_keys(self):
-        self.static_private = x25519.X25519PrivateKey.generate()
-        pk = self.static_private.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
-        with open(self.key_file, 'w') as f: json.dump({'priv': pk.hex()}, f)
+    def obtener_mi_clave_publica_bytes(self):
+        """Devuelve mi clave de chat (32 bytes) para enviarla"""
+        return self.static_public.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
 
-    def get_my_identity_pack(self):
-        """Genera el paquete de identidad: [MiClaveChat + Certificado + Firma]"""
-        # 1. Obtener bytes de mi clave de chat
-        pub_bytes = self.static_public.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    def generar_paquete_verificacion(self):
+        """
+        Genera el paquete que demuestra tu identidad:
+        1. Coge tu Clave Pública de Chat.
+        2. Usa el DNIe para firmarla.
+        3. Devuelve: [Certificado] + [Firma]
+        """
+        mis_bytes_chat = self.obtener_mi_clave_publica_bytes()
         
-        # 2. Firmar esos bytes con el DNIe
         handler = DNIeHandler()
-        handler.login()
-        cert_der, signature = handler.find_auth_cert_and_sign(pub_bytes)
-        handler.logout()
+        # Aquí te pedirá el PIN, pero solo devuelve la firma resultante
+        cert_der, firma = handler.login_y_firmar(mis_bytes_chat)
         
-        return pub_bytes, cert_der, signature
+        return cert_der, firma
 
-    def verify_peer_identity(self, static_key_bytes, cert_der, signature):
-        """Verifica matemáticamente que el DNIe firmó la clave del chat"""
+    def verificar_identidad_del_otro(self, su_clave_chat_bytes, su_cert_der, su_firma):
+        """
+        Verifica que la clave de chat del otro usuario fue firmada por su DNIe.
+        """
         try:
-            # 1. Cargar certificado
-            cert = x509.load_der_x509_certificate(cert_der, default_backend())
-            rsa_pub = cert.public_key()
+            # 1. Cargar el certificado del DNIe del otro
+            cert = x509.load_der_x509_certificate(su_cert_der, default_backend())
+            rsa_public_key = cert.public_key()
             
-            # 2. Verificar firma RSA (Sha256)
-            rsa_pub.verify(
-                signature,
-                static_key_bytes,
+            # 2. Comprobar la firma:
+            # ¿Es 'su_firma' válida para los datos 'su_clave_chat' usando la 'rsa_public_key'?
+            rsa_public_key.verify(
+                su_firma,
+                su_clave_chat_bytes, # <--- VERIFICAMOS QUE FIRMÓ SU CLAVE DE CHAT
                 padding.PKCS1v15(),
                 hashes.SHA256()
             )
             
-            # 3. Extraer nombre
-            cn = "Desconocido"
+            # 3. Extraer nombre real
+            nombre_real = "Desconocido"
             for attr in cert.subject:
                 if attr.oid == x509.NameOID.COMMON_NAME:
-                    cn = attr.value
+                    nombre_real = attr.value
             
-            return True, cn
+            return True, nombre_real
         except Exception as e:
             return False, str(e)
 
-# --- SESIÓN CHAT ---
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-
+# --- CLASE DE SESIÓN (Persistencia) ---
 class SessionCrypto:
     def __init__(self, private_key):
         self.ephemeral = x25519.X25519PrivateKey.generate()
         self.cipher = None
-        self.shared_key = None
+        self.shared_key = None 
 
     def get_ephemeral_public_bytes(self):
         return self.ephemeral.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
 
     def perform_handshake(self, peer_bytes, is_initiator=True):
         peer_pub = x25519.X25519PublicKey.from_public_bytes(peer_bytes)
-        secret = self.ephemeral.exchange(peer_pub)
+        shared = self.ephemeral.exchange(peer_pub)
         hkdf = HKDF(hashes.BLAKE2s(32), 32, None, b"CHAT_V1")
-        self.shared_key = hkdf.derive(secret)
+        self.shared_key = hkdf.derive(shared)
         self.cipher = ChaCha20Poly1305(self.shared_key)
 
     def encrypt(self, txt):
@@ -229,9 +179,7 @@ class SessionCrypto:
     def decrypt(self, data):
         return self.cipher.decrypt(data[:12], data[12:], None).decode()
 
-    def export_secret(self):
-        return self.shared_key.hex() if self.shared_key else None
-    
-    def load_secret(self, hx):
+    def export_secret(self): return self.shared_key.hex() if self.shared_key else None
+    def load_secret(self, hx): 
         self.shared_key = bytes.fromhex(hx)
         self.cipher = ChaCha20Poly1305(self.shared_key)
