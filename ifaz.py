@@ -1,44 +1,47 @@
-import asyncio
-import sys
-import socket
-import json
-import os
-import threading
-import zlib
-import struct
-import pygame
+import asyncio, sys, socket, json, os, threading, zlib, struct, uuid, base64, pygame, time
+
 from datetime import datetime
 from PIL import Image as PILImage, ImageSequence
 
 # Módulos propios
 from crypto import KeyManager, SessionCrypto
-from protocol import ChatProtocol, MSG_HELLO, MSG_DATA, MSG_DISCOVERY, MSG_AUTH
+from protocol import ChatProtocol, MSG_HELLO, MSG_DATA, MSG_AUTH, MSG_ACK, MSG_BYE
+from discovery import DiscoveryManager
 
-# Configuración
+# Configuración interfaz.
 ANCHO, ALTO = 950, 650 
-COLOR_FONDO = (0, 10, 0) 
-COLOR_TEXTO = (50, 220, 50)      
-COLOR_TEXTO_YO = (150, 255, 150)
-COLOR_MARCO = (20, 100, 20)
-COLOR_SYS   = (50, 150, 150)
+COLOR_FONDO = (10, 15, 10) 
+COLOR_TEXTO = (50, 220, 50)
+COLOR_MARCO = (30, 60, 30)
 
-BTN_IDLE    = (0, 40, 0)
-BTN_HOVER   = (0, 70, 0)
+TXT_NORMAL = (200, 255, 200)
+TXT_ME     = (220, 255, 220)
+TXT_SYS    = (100, 200, 200)
+TXT_TIME   = (150, 180, 150)
+
+BUBBLE_ME    = (20, 60, 20)
+BUBBLE_OTHER = (30, 30, 35)
+BUBBLE_SYS   = (10, 20, 20)
+
+BTN_IDLE    = (20, 40, 20)
+BTN_HOVER   = (40, 80, 40)
 BTN_ACTIVE  = (0, 100, 0)
 BTN_ALERT   = (180, 100, 0)
-BTN_VERIFIED = (218, 165, 32)
+BTN_VERIFIED= (218, 165, 32)
+BTN_OFFLINE = (50, 50, 50)
 
-PORT = 8888
 SESSION_FILE = "sessions.json"
 
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-# --- UTILIDADES ---
+
+# Funciones de la interfaz. El código más "técnico" está a partir de la línea 145 :)
+
+# Función para que el texto no se salga de la interfaz.
 def wrap_text(text, font, max_width):
     words = text.split(' ')
-    lines = []
-    current = ""
+    lines, current = [], ""
     for w in words:
         test = current + " " + w if current else w
         if font.size(test)[0] <= max_width: current = test
@@ -48,6 +51,8 @@ def wrap_text(text, font, max_width):
     if current: lines.append(current)
     return lines
 
+
+# Función para cargar los gifs.
 def load_gif_frames(filepath, size=None):
     frames = []
     if not os.path.exists(filepath): return []
@@ -61,6 +66,8 @@ def load_gif_frames(filepath, size=None):
     except: pass
     return frames
 
+
+# Función para cargar las imágenes de los personajes.
 class CodecCharacterLoader:
     def __init__(self):
         self.chars = {}; self.keys = []
@@ -69,7 +76,7 @@ class CodecCharacterLoader:
         f = os.path.join("assets", "characters")
         if not os.path.exists(f): os.makedirs(f, exist_ok=True)
         s = pygame.Surface((150, 200)); s.fill((0,20,0))
-        pygame.draw.rect(s, COLOR_TEXTO, (0,0,150,200), 2)
+        pygame.draw.rect(s, COLOR_MARCO, (0,0,150,200), 2)
         self.chars['default'] = [s]
         for file in os.listdir(f):
             if file.endswith('.gif'):
@@ -80,31 +87,62 @@ class CodecCharacterLoader:
         if not self.keys: return self.chars['default']
         return self.chars[self.keys[zlib.crc32(str(uid).encode()) % len(self.keys)]]
 
+
+# Clase que define las funciones de la aplicación.
 class AppState:
     def __init__(self):
         self.peers = {}
         self.incoming_ids = []
         self.messages = []
         self.input_text = ""
-        self.my_name = "Snake"
+        self.my_name = "Juan"
         self.target_name = None
+        self.target_info = None
         self.status_msg = "EN LOBBY"
         self.talking_timer = {}
         self.sound_queue = []
-    def add_message(self, snd, txt, is_me=False, is_sys=False):
-        t = datetime.now().strftime("%H:%M")
-        self.messages.append({'sender': snd, 'text': txt, 'is_me': is_me, 'is_sys': is_sys, 'time': t})
+    
+
+    # Añadimos los mensajes para mostrarlos por pantalla.
+    def add_message(self, snd, txt, is_me=False, is_sys=False, mid=None, time_str=None, status='sent'):
+        if not time_str: time_str = datetime.now().strftime("%H:%M")
+        msg_obj = {
+            'id': mid, 'sender': snd, 'text': txt, 
+            'is_me': is_me, 'is_sys': is_sys, 'time': time_str, 'status': status
+        }
+        self.messages.append(msg_obj)
         if not is_sys:
             self.talking_timer[snd] = pygame.time.get_ticks() + 2500
             if not is_me: self.sound_queue.append("msg")
+        return msg_obj 
+
+
+    # Función que usamos cuando queremos limpiar la pantalla y vaciar la lista de mensajes.
+    def clear_messages(self):
+        self.messages = []
+
+
+    # Función que marca el ACK a un mensaje.
+    def mark_ack(self, mid):
+        for m in reversed(self.messages):
+            if m['id'] == mid: m['status'] = 'ack'; return
+            
+    # Función que marca el check de enviado de un mensaje.
+    def mark_sent(self, mid):
+        for m in reversed(self.messages):
+            if m['id'] == mid: m['status'] = 'sent'; return
+
     def is_talking(self, name):
         return name in self.talking_timer and pygame.time.get_ticks() < self.talking_timer[name]
+    
     def set_status(self, t): self.status_msg = t
+
 
 STATE = AppState()
 CHARS = None
 
-# --- RED ---
+
+# Función que obtiene la ip de la red.
 def get_best_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try: s.connect(('8.8.8.8', 1)); IP = s.getsockname()[0]
@@ -112,225 +150,450 @@ def get_best_ip():
     finally: s.close()
     return IP
 
+
+# Clase que define a los usuarios y sus funciones.
 class ChatClient:
-    def __init__(self, name):
+    def __init__(self, name, port):
         self.name = name
+        self.port = port
         self.loop = asyncio.get_running_loop()
         self.my_ip = get_best_ip()
-        self.broadcast_addr = "255.255.255.255"
         self.key_manager = KeyManager(f"{name}_identity")
-        self.sessions = {}
+        self.sessions = {} 
         self.peers = {}
         self.peer_counter = 0
-        self.target_ip = None
         self.pending_requests = {}
         self.verified_users = {}
+        self.offline_peers = set()
+        self.reconnecting_peers = set()
+        self.handshake_cooldowns = {}
+        self.chat_histories = {} 
+        self.message_queue = {} 
         self.protocol = ChatProtocol(self.on_packet)
-        self.load_sessions_from_disk()
+        self.discovery = DiscoveryManager(name, port, self.update_contacts)
 
+
+    # Pedimos las claves del DNIe antes de iniciar la interfaz para evitar porblemas de bloqueo.
     def iniciar_dnie_antes_de_gui(self):
-        return self.key_manager.iniciar_sesion_dnie()
+        ok = self.key_manager.iniciar_sesion_dnie()
+        if ok: self.load_sessions_securely()
+        return ok
 
-    def load_sessions_from_disk(self):
+
+    # Cambiamos de chat desde la barra de navegación de contactos.
+    def switch_chat_view(self, ip, port, name):
+        STATE.clear_messages()
+        sk = f"{ip}:{port}"
+        if sk in self.chat_histories:
+            STATE.messages.extend(self.chat_histories[sk])
+        STATE.target_info = (ip, port)
+        STATE.target_name = name
+        STATE.set_status(f"CONECTADO: {name}")
+
+
+    # Almacenamos los mensajes en el JSON cifrado.
+    def save_msg_to_history(self, sk, msg_obj):
+        if sk not in self.chat_histories: self.chat_histories[sk] = []
+        exists = False
+        for m in self.chat_histories[sk]:
+            if m['id'] == msg_obj['id']:
+                m.update(msg_obj)
+                exists = True
+                break
+        if not exists:
+            self.chat_histories[sk].append(msg_obj)
+        self.save_sessions_securely() 
+
+    # Envíamos los mensajes que estén pendientes.
+    def flush_queue(self, ip, port):
+        sk = f"{ip}:{port}"
+        if sk in self.message_queue and self.message_queue[sk]:
+            pending = self.message_queue[sk]
+            count = len(pending)
+            STATE.add_message("SYS", f"Enviando {count} mensajes en cola...", True)
+
+            still_pending = []
+            for msg_data in pending:
+                try:
+                    payload = json.dumps({"id": msg_data['id'], "msg": msg_data['text']})
+                    enc = self.sessions[sk].encrypt(payload)
+                    self.protocol.send_packet(ip, port, MSG_DATA, 1, enc)
+
+                    STATE.mark_sent(msg_data['id'])
+
+                    msg_data['status'] = 'sent'
+                    self.save_msg_to_history(sk, msg_data)
+                    
+                except Exception as e:
+                    still_pending.append(msg_data)
+            
+            if not still_pending:
+                del self.message_queue[sk]
+            else:
+                self.message_queue[sk] = still_pending
+
+
+    # Función que nos permite agestionar los "reencuentros".
+    def update_contacts(self, action, name, info):
+        if action == "ADD" and info:
+            try:
+                ip = socket.inet_ntoa(info.addresses[0])
+                port = info.port
+                clean = name.split('.')[0]
+                if ip == self.my_ip and port == self.port: return
+
+                k = f"{ip}:{port}"
+
+                # Si estaba OFFLINE, lo pasamos a ONLINE.
+                if k in self.offline_peers: 
+                    self.offline_peers.remove(k)
+                    if STATE.target_info == (ip, port):
+                        STATE.set_status(f"CONECTADO: {self.verified_users.get(k, clean)}")
+                        STATE.add_message("SYS", f"{clean} ha vuelto ONLINE.", True)
+                    
+                    self.flush_queue(ip, port)
+
+                exists = False
+                for p in self.peers.values():
+                    if p['ip'] == ip and p['port'] == port: exists = True
+                
+
+                # Si no lo teníamos guardado, lo guardamos.
+                if not exists:
+                    pid = self.peer_counter
+                    self.peers[pid] = {'ip': ip, 'port': port, 'name': clean}
+                    self.peer_counter += 1
+                    STATE.peers = self.peers.copy()
+                    if k not in self.sessions:
+                        STATE.sound_queue.append("contact")
+                        STATE.add_message("SYS", f"RADAR: {clean}", True)
+
+
+                # Si ya lo teníamos guardado, hacemos un saludo pero sin todo el handshake.
+                if k in self.sessions:
+                    self.perform_background_reconnect(ip, port)
+            except: pass
+
+
+    # Saludo que hacemos cuando reconectamos con un contacto existente para no hacer el handshake otra vez.
+    def perform_background_reconnect(self, ip, port):
+        try:
+            sess_key = f"{ip}:{port}"
+            s = self.sessions[sess_key]
+            mk = s.get_public_bytes()
+            self.protocol.send_packet(ip, port, MSG_HELLO, 0, mk)
+        except: pass
+
+
+    # Cargamos la claves establecidas con el contacto anteriormente y restauramos sus mensajes.
+    def load_sessions_securely(self):
         if not os.path.exists(SESSION_FILE): return
         try:
-            with open(SESSION_FILE, 'r') as f: d = json.load(f)
+            with open(SESSION_FILE, 'r') as f: wrapper = json.load(f)
+            b64_data = wrapper.get("content", "")
+            if not b64_data: return
+            encrypted_bytes = base64.b64decode(b64_data)
+            json_plain = self.key_manager.decrypt_disk_data(encrypted_bytes)
+            if not json_plain: return
+            
+            data = json.loads(json_plain)
             c = 0
-            for ip, hx in d.items():
-                s = SessionCrypto() # ARREGLADO: Sin argumentos
-                try: s.load_secret(hx); self.sessions[ip] = s; c += 1
+            for sk, entry in data.items():
+                hex_key = entry if isinstance(entry, str) else entry.get('key')
+                s = SessionCrypto()
+                try: 
+                    s.load_secret(hex_key)
+                    self.sessions[sk] = s
+                    c += 1
+                    if isinstance(entry, dict):
+                        self.chat_histories[sk] = entry.get('history', [])
+                        vname = entry.get('verified_name')
+                        self.verified_users[sk] = vname if vname else ""
                 except: pass
-            if c > 0: STATE.add_message("SYS", f"💾 {c} sesiones cargadas.", True)
+            if c > 0: STATE.add_message("SYS", f"{c} chats recuperados.", True)
         except: pass
 
-    def save_sessions_to_disk(self):
-        d = {ip: s.export_secret() for ip, s in self.sessions.items() if s.export_secret()}
+
+    # Guardamos las claves y los mensajes con nuestros contactos.
+    def save_sessions_securely(self):
+        export_data = {}
+        for sk, s in self.sessions.items():
+            if s.export_secret():
+                export_data[sk] = {
+                    'key': s.export_secret(),
+                    'history': self.chat_histories.get(sk, []),
+                    'verified_name': self.verified_users.get(sk, "") 
+                }
         try: 
-            with open(SESSION_FILE, 'w') as f: json.dump(d, f, indent=4)
+            json_plain = json.dumps(export_data)
+            encrypted_bytes = self.key_manager.encrypt_disk_data(json_plain)
+            if not encrypted_bytes: return
+            b64_data = base64.b64encode(encrypted_bytes).decode('utf-8')
+            wrapper = {"content": b64_data}
+            with open(SESSION_FILE, 'w') as f: json.dump(wrapper, f, indent=4)
         except: pass
 
+
+    # Activamos el transporte en el puerto seleccionado.
     async def start(self):
         self.transport, _ = await self.loop.create_datagram_endpoint(
-            lambda: self.protocol, local_addr=("0.0.0.0", PORT), allow_broadcast=True
+            lambda: self.protocol, local_addr=("0.0.0.0", self.port), allow_broadcast=True
         )
-        self.loop.create_task(self.beacon_loop())
+        await self.discovery.start()
 
-    async def beacon_loop(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        try: s.bind((self.my_ip, 0))
-        except: pass
-        msg = f"DISCOVERY:{self.name}".encode()
-        while True:
-            try: s.sendto(msg, (self.broadcast_addr, PORT))
+
+    # Cerramos el transporte y envíamos un mensaje de que estamos OFFLINE.
+    async def stop(self):
+        for k in self.sessions:
+            try:
+                ip, p = k.split(":")
+                for _ in range(5):
+                    self.protocol.send_packet(ip, int(p), MSG_BYE, 0, b"")
             except: pass
-            await asyncio.sleep(3)
+        await self.discovery.stop()
 
+
+    # Esta función muestra el mensaje por pantalla de que estamos realizando la verificación..
     def send_verification(self):
-        if not self.target_ip: return STATE.add_message("SYS", "⛔ Conecta primero.", True)
-        STATE.add_message("SYS", "💳 Firmando...", True)
+        if not STATE.target_info: return STATE.add_message("SYS", "Conecta primero.", True)
+        STATE.add_message("SYS", "Firmando...", True)
         threading.Thread(target=self._firmar_y_enviar, daemon=True).start()
 
+
+    # Esta función permite al otro extremo verificar nuestra identidad.
     def _firmar_y_enviar(self):
         try:
-            # ARREGLADO: Usamos get_public_bytes
-            clave_pub = self.sessions[self.target_ip].get_public_bytes() 
+            key_sess = f"{STATE.target_info[0]}:{STATE.target_info[1]}"
+            clave_pub = self.sessions[key_sess].get_public_bytes()
             cert, firma = self.key_manager.firmar_handshake(clave_pub)
             if not cert: return
-            
             payload = struct.pack("!I", len(cert)) + cert + \
                       struct.pack("!I", len(firma)) + firma + \
                       clave_pub
-            
-            enc = self.sessions[self.target_ip].encrypt(payload.decode('latin1'))
-            self.loop.call_soon_threadsafe(self.protocol.send_packet, self.target_ip, PORT, MSG_AUTH, 0, enc)
-            STATE.add_message("SYS", "📤 Identidad enviada.", True)
-        except Exception as e: STATE.add_message("SYS", f"❌ Error DNIe: {e}", True)
+            enc = self.sessions[key_sess].encrypt(payload.decode('latin1'))
+            ip, port = STATE.target_info
+            self.loop.call_soon_threadsafe(self.protocol.send_packet, ip, port, MSG_AUTH, 0, enc)
+            STATE.add_message("SYS", "Identidad enviada.", True)
+        except Exception as e: STATE.add_message("SYS", f"Error DNIe: {e}", True)
 
+
+    # Esta función es la clave xd.
+    # Aqui es donde procesamos los mensajes en función de su cabecera.
     def on_packet(self, pkt, addr):
-        ip = addr[0]
-        if ip == self.my_ip: return
+        ip, port = addr
+        sk = f"{ip}:{port}"
 
-        if pkt.msg_type == MSG_DISCOVERY:
-            n = pkt.payload.decode('utf-8', 'ignore') if isinstance(pkt.payload, bytes) else str(pkt.payload)
-            if ip not in [p['ip'] for p in self.peers.values()]:
-                pid = self.peer_counter; self.peers[pid] = {'ip': ip, 'name': n}; self.peer_counter += 1
-                STATE.peers = self.peers.copy()
-                if not self.target_ip: 
-                    STATE.sound_queue.append("contact")
-                    STATE.add_message("SYS", f"Radar: {n}", True)
+        # Paquetes de handshake.
+        if pkt.msg_type == MSG_HELLO:
 
-        elif pkt.msg_type == MSG_HELLO:
-            if ip in self.sessions:
+            # Si el remitente está está en nuestra lista le devolvemos el HELLO.
+            if sk in self.sessions:
                 try:
-                    self.sessions[ip].compute_secret(pkt.payload) # Renegociar
-                    self.save_sessions_to_disk()
-                    STATE.sound_queue.append("open")
-                    STATE.add_message("SYS", f"✅ CONEXIÓN OK: {ip}", True)
-                except: pass
-            elif ip not in self.pending_requests:
-                self.pending_requests[ip] = pkt.payload
-                name = ip
-                for d in self.peers.values(): 
-                    if d['ip'] == ip: name = d['name']
-                
-                pid_found = -1
-                for pid, d in self.peers.items():
-                    if d['ip'] == ip: pid_found = pid
-                if pid_found != -1 and pid_found not in STATE.incoming_ids:
-                    STATE.incoming_ids.append(pid_found)
-
-                STATE.sound_queue.append("call")
-                STATE.add_message("SYS", f"🔔 LLAMADA DE {name}", True)
-
-        elif pkt.msg_type == MSG_DATA:
-            if ip in self.sessions:
-                try:
-                    msg = self.sessions[ip].decrypt(pkt.payload)
-                    sender = self.verified_users.get(ip, ip)
-                    if sender == ip: 
-                        for p in self.peers.values(): 
-                            if p['ip'] == ip: sender = p['name']
-                    STATE.add_message(sender, msg)
-                except:
-                    del self.sessions[ip]
-                    self.connect_manual(ip)
-            else: self.connect_manual(ip)
-
-        elif pkt.msg_type == MSG_AUTH:
-            if ip in self.sessions:
-                try:
-                    dec = self.sessions[ip].decrypt(pkt.payload).encode('latin1')
-                    off = 0
-                    l_c = struct.unpack("!I", dec[off:off+4])[0]; off+=4
-                    cert = dec[off:off+l_c]; off+=l_c
-                    l_s = struct.unpack("!I", dec[off:off+4])[0]; off+=4
-                    sig = dec[off:off+l_s]; off+=l_s
-                    pk = dec[off:] 
+                    self.sessions[sk].compute_secret(pkt.payload)
+                    self.save_sessions_securely()
+                    self.flush_queue(ip, port)
                     
-                    valid, cn = self.key_manager.verificar_handshake(pk, cert, sig)
-                    if valid:
-                        STATE.sound_queue.append("open")
-                        STATE.add_message("SYS", f"✅ DNIe VERIFICADO: {cn}", True)
-                        self.verified_users[ip] = f"{cn} [✓]"
-                        if self.target_ip == ip:
-                            STATE.target_name = self.verified_users[ip]
-                            STATE.set_status(f"CONECTADO: {STATE.target_name}")
-                    else: STATE.add_message("SYS", f"❌ FIRMA FALSA", True)
+                    last_time = self.handshake_cooldowns.get(sk, 0)
+                    now = time.time()
+                    if now - last_time > 5:
+                        mk = self.sessions[sk].get_public_bytes()
+                        self.protocol.send_packet(ip, port, MSG_HELLO, 0, mk)
+                        self.handshake_cooldowns[sk] = now
+                except: pass
+                return
+
+            # Si está en pendientes notificamos al usuario por pantalla para que lo acepte (si quiere).
+            if sk not in self.pending_requests:
+                self.pending_requests[sk] = pkt.payload
+                name = f"{ip}:{port}"
+                pid = -1
+                for p, d in self.peers.items():
+                    if d['ip']==ip and d['port']==port: name, pid = d['name'], p
+                if pid != -1 and pid not in STATE.incoming_ids: STATE.incoming_ids.append(pid)
+                STATE.sound_queue.append("call")
+                if not STATE.target_info:
+                    STATE.add_message("SYS", f"[!] LLAMADA DE: {name}", True)
+
+        # Paquetes de chat.
+        elif pkt.msg_type == MSG_DATA:
+            if sk in self.sessions:
+                try:
+                    dec = self.sessions[sk].decrypt(pkt.payload)
+                    data = json.loads(dec)
+                    msg_text, msg_id = data.get("msg", ""), data.get("id", "")
+                    
+                    snd = self.verified_users.get(sk, sk)
+                    if snd == sk:
+                        for p in self.peers.values():
+                            if p['ip']==ip and p['port']==port: snd = p['name']
+                    
+                    msg_obj = {
+                        'id': msg_id, 'sender': snd, 'text': msg_text, 
+                        'is_me': False, 'is_sys': False, 'time': datetime.now().strftime("%H:%M"), 'status': 'received'
+                    }
+                    self.save_msg_to_history(sk, msg_obj)
+
+                    if STATE.target_info == (ip, port):
+                        STATE.add_message(snd, msg_text, mid=msg_id)
+                    
+                    ack = json.dumps({"id": msg_id})
+                    enc_ack = self.sessions[sk].encrypt(ack)
+                    self.protocol.send_packet(ip, port, MSG_ACK, 0, enc_ack)
+                except:
+                    del self.sessions[sk]
+                    self.reconnecting_peers.add(sk)
+                    self.connect_manual(ip, port, "RECONNECT")
+            else: 
+                self.reconnecting_peers.add(sk)
+                self.connect_manual(ip, port, "RECONNECT")
+
+        # Mensaje de tipo ACK.
+        elif pkt.msg_type == MSG_ACK:
+            if sk in self.sessions:
+                try:
+                    dec = self.sessions[sk].decrypt(pkt.payload)
+                    d = json.loads(dec)
+                    mid = d.get("id")
+                    if mid:
+                        STATE.mark_ack(mid)
+                        if sk in self.chat_histories:
+                            for m in reversed(self.chat_histories[sk]):
+                                if m['id'] == mid: m['status'] = 'ack'; break
+                        self.save_sessions_securely()
                 except: pass
 
-    def connect_manual(self, ip, name="Unknown"):
-        if ip in self.sessions:
-            real = self.verified_users.get(ip, name)
-            self.target_ip, STATE.target_name = ip, real
-            STATE.set_status(f"CONECTADO: {real}")
-            STATE.add_message("SYS", "Retomando chat.", True)
+        # Mensaje que nos avisa que el contacto pasa a estar OFFLINE.
+        elif pkt.msg_type == MSG_BYE:
+            if sk not in self.offline_peers:
+                self.offline_peers.add(sk)
+                if STATE.target_info == (ip, port):
+                    STATE.set_status(f"OFFLINE: {STATE.target_name}")
+
+        # Mensaje para verificar la identidad del remitente.
+        elif pkt.msg_type == MSG_AUTH:
+            if sk in self.sessions:
+                try:
+                    dec = self.sessions[sk].decrypt(pkt.payload).encode('latin1')
+                    o=0; lc=struct.unpack("!I", dec[o:o+4])[0]; o+=4
+                    cert=dec[o:o+lc]; o+=lc
+                    ls=struct.unpack("!I", dec[o:o+4])[0]; o+=4
+                    sig=dec[o:o+ls]; o+=ls
+                    pk=dec[o:] 
+                    v, cn = self.key_manager.verificar_handshake(pk, cert, sig)
+                    if v:
+                        STATE.sound_queue.append("open")
+                        STATE.add_message("SYS", f">> DNIe VERIFICADO: {cn}", True)
+                        self.verified_users[sk] = f"{cn} [OK]"
+                        self.save_sessions_securely()
+                        if STATE.target_info == (ip, port):
+                            STATE.target_name = self.verified_users[sk]
+                            STATE.set_status(f"CONECTADO: {STATE.target_name}")
+                    else: STATE.add_message("SYS", "XXX FIRMA FALSA XXX", True)
+                except: pass
+
+
+    # Función que nos permite conectarnos a un usuario que no tenemos en nuestra lsita de contactos.
+    def connect_manual(self, ip, port, name="Unknown"):
+        sk = f"{ip}:{port}"
+        if sk in self.sessions:
+            real = self.verified_users.get(sk, name)
+            if sk in self.offline_peers: self.offline_peers.remove(sk)
+            self.switch_chat_view(ip, port, real)
+            self.flush_queue(ip, port)
             return
 
-        STATE.add_message("SYS", f"--> Llamando a {name}...", True)
-        # ARREGLADO: Sin argumentos
+        STATE.clear_messages()
+        STATE.add_message("SYS", f"--> INICIANDO HANDSHAKE: {name}...", True)
         s = SessionCrypto()
-        self.sessions[ip] = s
-        
-        # ARREGLADO: get_public_bytes
+        self.sessions[sk] = s
         mk = s.get_public_bytes()
-        
-        for _ in range(3): self.protocol.send_packet(ip, PORT, MSG_HELLO, 0, mk)
-        self.target_ip, STATE.target_name = ip, name
+        self.handshake_cooldowns[sk] = time.time()
+        for _ in range(3): self.protocol.send_packet(ip, port, MSG_HELLO, 0, mk)
+        STATE.target_info = (ip, port)
+        STATE.target_name = name
         STATE.set_status(f"LLAMANDO A {name}...")
 
+
+    # Función que nos permite devolver el handshake que alguien ha iniciado con nosotros.
     def accept_connection(self, pid):
         if pid not in self.peers: return
-        ip = self.peers[pid]['ip']
-        name = self.peers[pid]['name']
-        if ip not in self.pending_requests: return
+        ip = self.peers[pid]['ip']; port = self.peers[pid]['port']; name = self.peers[pid]['name']
+        sk = f"{ip}:{port}"
+        if sk not in self.pending_requests: return
         
-        STATE.add_message("SYS", "Conectando...", True)
-        # ARREGLADO: Sin argumentos
+        STATE.clear_messages()
+        STATE.add_message("SYS", "ESTABLECIENDO CIFRADO...", True)
         s = SessionCrypto()
-        self.sessions[ip] = s
-        s.compute_secret(self.pending_requests[ip])
-        
-        # ARREGLADO: get_public_bytes
+        self.sessions[sk] = s
+        s.compute_secret(self.pending_requests[sk])
         mk = s.get_public_bytes()
-        
-        for _ in range(3): self.protocol.send_packet(ip, PORT, MSG_HELLO, 0, mk)
-        
-        del self.pending_requests[ip]
+        self.handshake_cooldowns[sk] = time.time()
+        for _ in range(3): self.protocol.send_packet(ip, port, MSG_HELLO, 0, mk)
+        del self.pending_requests[sk]
         if pid in STATE.incoming_ids: STATE.incoming_ids.remove(pid)
-        self.save_sessions_to_disk()
-        self.target_ip = ip
-        STATE.target_name = name
-        STATE.set_status(f"CONECTADO: {name}")
-        STATE.sound_queue.append("open")
+        
+        self.switch_chat_view(ip, port, name)
+        self.save_sessions_securely()
+        STATE.add_message("SYS", f">> CANAL SEGURO ESTABLECIDO.", True)
 
+
+    # Función para enviar mensajes.
     def send_msg(self, text):
-        if self.target_ip: 
+        if STATE.target_info: 
+            ip, port = STATE.target_info
+            sk = f"{ip}:{port}"
+            
+            # ID aleatorio generado para un mensaje.
+            mid = str(uuid.uuid4())[:8]
+            
+            # Si está OFFLINE, lo guardamos en cola.
+            if sk in self.offline_peers:
+                if sk not in self.message_queue: self.message_queue[sk] = []
+                
+                msg_data = {
+                    'id': mid, 'sender': self.name, 'text': text, 
+                    'is_me': True, 'is_sys': False, 'time': datetime.now().strftime("%H:%M"), 'status': 'queued'
+                }
+                self.message_queue[sk].append(msg_data)
+            
+                STATE.add_message(self.name, text, True, mid=mid, status='queued')
+                self.save_msg_to_history(sk, msg_data)
+                
+                STATE.add_message("SYS", "En cola (Usuario Offline).", True)
+                return
+
+            # Si está ONLINE, lo enviamos.
             try:
-                enc = self.sessions[self.target_ip].encrypt(text)
-                self.protocol.send_packet(self.target_ip, PORT, MSG_DATA, 1, enc)
-                STATE.add_message(self.name, text, True)
+                pl = json.dumps({"id": mid, "msg": text})
+                enc = self.sessions[sk].encrypt(pl)
+                self.protocol.send_packet(ip, port, MSG_DATA, 1, enc)
+                m_obj = STATE.add_message(self.name, text, True, mid=mid)
+                self.save_msg_to_history(sk, m_obj)
             except: pass
 
+
+    # Si escribimos /verify, permitimos a nuestro contacto verificar nuestra identidad.
+    # Si escribimos /leave, salimos.
     def process_command(self, text):
         if text == "/verify": self.send_verification()
         elif text == "/leave":
-            self.target_ip = None
+            STATE.target_info = None
             STATE.set_status("LOBBY")
-            STATE.add_message("SYS", "Desconectado.", True)
-        elif self.target_ip: self.send_msg(text)
+            STATE.clear_messages()
+            STATE.add_message("SYS", "VUELTA AL LOBBY.", True)
+        elif STATE.target_info: self.send_msg(text)
 
+# Clase que estructura toda la interfaz.
 class CodecDisplay:
     def __init__(self, size):
         self.bg_frames = load_gif_frames("assets/codec_background.gif", (ANCHO, 350))
         if not self.bg_frames: self.bg_frames=[pygame.Surface((ANCHO, 350))]
         self.frame_idx = 0
         self.active_buttons = []
+        self.scroll_y = 0 
         try: pygame.mixer.init(); self.snd = {
-            "call": pygame.mixer.Sound("assets/call.mp3"),
-            "msg": pygame.mixer.Sound("assets/call.mp3"),
-            "contact": pygame.mixer.Sound("assets/call.mp3"),
-            "open": pygame.mixer.Sound("assets/open.mp3")
+            "call": pygame.mixer.Sound("assets/call.mp3"), "msg": pygame.mixer.Sound("assets/call.mp3"),
+            "contact": pygame.mixer.Sound("assets/call.mp3"), "open": pygame.mixer.Sound("assets/open.mp3")
         }
         except: self.snd = {}
 
@@ -340,6 +603,15 @@ class CodecDisplay:
             s = STATE.sound_queue.pop(0)
             if s in self.snd: self.snd[s].play()
 
+
+    # Función para hacer scroll en el chat.
+    def handle_scroll(self, event):
+        if event.type == pygame.MOUSEWHEEL:
+            self.scroll_y += event.y * 20
+            if self.scroll_y < 0: self.scroll_y = 0
+
+
+    # Función que muestra por pantalla toda la información.
     def draw(self, screen, font, font_ui, client):
         screen.fill(COLOR_FONDO)
         screen.blit(self.bg_frames[self.frame_idx], (0, 20))
@@ -347,98 +619,179 @@ class CodecDisplay:
         self._draw_face(screen, STATE.my_name, 675, 30)
         if STATE.target_name: self._draw_face(screen, STATE.target_name, 130, 30)
 
-        h_chat, y_base = 340, 238
+        h_chat = 360; y_base = 238
         sidebar = pygame.Rect(30, y_base, 200, h_chat)
-        chat = pygame.Rect(240, y_base, 680, h_chat)
+        chat_disp = pygame.Rect(240, y_base, 680, h_chat - 50) 
+        input_area = pygame.Rect(240, y_base + h_chat - 40, 680, 40)
 
         pygame.draw.rect(screen, (0,15,0), sidebar); pygame.draw.rect(screen, COLOR_MARCO, sidebar, 2)
         y_btn = sidebar.top + 10
         self.active_buttons = []
         
+        # Muestra la lista de usuarios.
         for pid, d in STATE.peers.items():
-            is_verif = "[✓]" in client.verified_users.get(d['ip'], "")
+            sk = f"{d['ip']}:{d['port']}"
+            is_verif = "[OK]" in (client.verified_users.get(sk) or "")
             is_in = pid in STATE.incoming_ids
-            is_conn = client.target_ip == d['ip']
-            col = BTN_VERIFIED if is_verif else (BTN_ALERT if is_in else (BTN_ACTIVE if is_conn else BTN_IDLE))
-            
+            is_off = sk in client.offline_peers
+            is_conn = False
+            if STATE.target_info: is_conn = (STATE.target_info[0] == d['ip'] and STATE.target_info[1] == d['port'])
+
+            col = BTN_OFFLINE if is_off else (BTN_VERIFIED if is_verif else (BTN_ALERT if is_in else (BTN_ACTIVE if is_conn else BTN_IDLE)))
             r = pygame.Rect(sidebar.left+5, y_btn, 190, 30)
-            pygame.draw.rect(screen, col, r)
-            pygame.draw.rect(screen, COLOR_MARCO, r, 1)
-            
-            lbl = f"{d['name'][:9]}"
-            if is_verif: lbl += " [✓]"
+            pygame.draw.rect(screen, col, r); pygame.draw.rect(screen, COLOR_MARCO, r, 1)
+            lbl = f"{d['name'][:9]}"; 
+            if is_verif: lbl += " [OK]"
             screen.blit(font.render(lbl, True, COLOR_TEXTO), (r.x+5, r.y+5))
-            
-            label = "LINKED" if is_conn else ("ACCEPT" if is_in else ("SECURE" if is_verif else "CALL"))
-            s_lbl = font.render(label, True, (0,0,0) if is_in or is_verif else COLOR_MARCO)
-            screen.blit(s_lbl, (r.right - s_lbl.get_width()-5, r.y+5))
-            
             self.active_buttons.append((r, pid))
             y_btn += 35
 
-        pygame.draw.rect(screen, (0,20,0), chat); pygame.draw.rect(screen, COLOR_MARCO, chat, 3)
-        screen.set_clip(chat)
-        y = chat.bottom - 40
-        for m in reversed(STATE.messages):
-            col = COLOR_SYS if m['is_sys'] else (COLOR_TEXTO_YO if m['is_me'] else COLOR_TEXTO)
-            txt = f"<{m['sender']}> {m['text']}"
-            for l in reversed(wrap_text(txt, font, chat.width-20)):
-                screen.blit(font.render(l, True, col), (chat.x+10, y))
-                y -= 20
-                if y < chat.top: break
-            if y < chat.top: break
-        screen.set_clip(None)
-        screen.blit(font.render(f"> {STATE.input_text}_", True, COLOR_TEXTO_YO), (chat.x+10, chat.bottom - 30))
+        # Aquí gestionamos la mecánica del chat.
+        pygame.draw.rect(screen, (0,20,0), chat_disp); pygame.draw.rect(screen, COLOR_MARCO, chat_disp, 3)
+        screen.set_clip(chat_disp)
+        
+        total_h = 0
+        msg_dims = []
+        for m in STATE.messages:
+            if m['is_sys']: h = 30
+            else:
+                lines = wrap_text(m['text'], font, chat_disp.width - 120)
+                h = (len(lines) * 20) + 30 
+                
+                # ICONOS DE ESTADO
+                st = m['status']
+                tick = "o" if st=='queued' else ("√" if st=='sent' else "√√")
+                if not m['is_me']: tick = ""
+                
+                tm = m['time'] + (f" [{tick}]" if tick else "")
+                
+                last_w = font.size(lines[-1])[0] if lines else 0
+                if last_w + font.size(tm)[0] + 40 > chat_disp.width - 120:
+                    h += 20 
+            msg_dims.append(h)
+            total_h += h + 10
 
+        if total_h > chat_disp.height:
+            max_scroll = total_h - chat_disp.height + 20
+            if self.scroll_y > max_scroll: self.scroll_y = max_scroll
+        else: self.scroll_y = 0
+
+        current_y = chat_disp.bottom - 10 + self.scroll_y
+        
+        for i in range(len(STATE.messages)-1, -1, -1):
+            m = STATE.messages[i]
+            h_bub = msg_dims[i]
+            y_bub = current_y - h_bub
+            
+            if y_bub > chat_disp.bottom: current_y -= (h_bub + 10); continue
+            if current_y < chat_disp.top: break
+
+            if m['is_sys']:
+                lines = wrap_text(m['text'], font, chat_disp.width - 40)
+                sy = y_bub + 5
+                for l in lines:
+                    txt = font.render(l, True, TXT_SYS)
+                    screen.blit(txt, (chat_disp.centerx - txt.get_width()//2, sy))
+                    sy += 20
+            else:
+                if m['is_me']: bg, col, align = BUBBLE_ME, TXT_ME, "right"
+                else: bg, col, align = BUBBLE_OTHER, TXT_NORMAL, "left"
+
+                full = m['text']
+                
+                st = m['status']
+                tick = "o" if st=='queued' else ("√" if st=='sent' else "√√")
+                if not m['is_me']: tick = ""
+                tm = m['time'] + (f" [{tick}]" if tick else "")
+
+                lines = wrap_text(full, font, chat_disp.width - 120)
+                
+                txt_w = max([font.size(l)[0] for l in lines] + [10])
+                tm_w = font.size(tm)[0]
+                w_bub = max(txt_w, tm_w) + 30 
+
+                if align == "right": x_bub = chat_disp.right - w_bub - 15
+                elif align == "left": x_bub = chat_disp.left + 15
+                else: x_bub = chat_disp.centerx - w_bub//2
+
+                r_bub = pygame.Rect(x_bub, y_bub, w_bub, h_bub)
+                pygame.draw.rect(screen, bg, r_bub, border_radius=10)
+                
+                ty = r_bub.y + 10
+                for l in lines:
+                    screen.blit(font.render(l, True, col), (r_bub.x+10, ty)); ty += 20
+                
+                t_surf = font.render(tm, True, TXT_TIME)
+                screen.blit(t_surf, (r_bub.right - t_surf.get_width()-8, r_bub.bottom-8))
+
+            current_y -= (h_bub + 10)
+
+        screen.set_clip(None)
+
+        pygame.draw.rect(screen, (0,15,0), input_area); pygame.draw.rect(screen, COLOR_MARCO, input_area, 2)
+        cursor = "_" if (pygame.time.get_ticks() // 500) % 2 == 0 else ""
+        full_in = f"> {STATE.input_text}{cursor}"
+        in_lines = wrap_text(full_in, font, input_area.width - 20)
+        yt = input_area.bottom - 25
+        for l in reversed(in_lines):
+            if yt < input_area.top: break
+            screen.blit(font.render(l, True, TXT_NORMAL), (input_area.x+10, yt))
+            yt -= 18
+
+    # Función para dibujar las caras de los personajes.
     def _draw_face(self, screen, name, x, y):
         clean_name = name.split(" [")[0].lower()
         frames = CHARS.get(clean_name)
         idx = (pygame.time.get_ticks()//100) % len(frames) if STATE.is_talking(clean_name) else 0
         screen.blit(frames[idx], (x, y))
 
+
+# Mian que ejecuta el programa.
 async def main():
     if len(sys.argv) > 1: name = sys.argv[1]
-    else: name = input("Nombre: ")
+    else: name = input("Nombre de Agente: ")
+    if len(sys.argv) > 2: port = int(sys.argv[2])
+    else: 
+        try: port = int(input("Puerto (por defecto 8888): "))
+        except: port = 8888
+
     STATE.my_name = name
-    
-    client = ChatClient(name)
+    client = ChatClient(name, port)
     if not client.iniciar_dnie_antes_de_gui(): return
 
     await client.start()
-
     pygame.init()
     screen = pygame.display.set_mode((ANCHO, ALTO))
-    pygame.display.set_caption("MGS CODEC")
+    pygame.display.set_caption(f"MGS CODEC - Puerto {port}")
+    global CHARS; CHARS = CodecCharacterLoader()
     
-    global CHARS
-    CHARS = CodecCharacterLoader()
     font = pygame.font.SysFont("consolas", 16)
     font_ui = pygame.font.SysFont("impact", 20)
     gui = CodecDisplay(screen.get_size())
-    clock = pygame.time.Clock()
-
+    
     running = True
     while running:
         for e in pygame.event.get():
             if e.type == pygame.QUIT: running = False
+            if e.type == pygame.MOUSEWHEEL: gui.handle_scroll(e)
             if e.type == pygame.KEYDOWN:
                 if e.key == pygame.K_RETURN:
-                    if STATE.input_text: client.process_command(STATE.input_text)
-                    STATE.input_text = ""
+                    if STATE.input_text: client.process_command(STATE.input_text); STATE.input_text = ""; gui.scroll_y = 0
                 elif e.key == pygame.K_BACKSPACE: STATE.input_text = STATE.input_text[:-1]
                 else: STATE.input_text += e.unicode
             if e.type == pygame.MOUSEBUTTONDOWN:
-                for r, pid in gui.active_buttons:
-                    if r.collidepoint(e.pos):
-                        if pid in STATE.incoming_ids: client.accept_connection(pid)
-                        else: client.connect_manual(client.peers[pid]['ip'], client.peers[pid]['name'])
+                if e.button == 1:
+                    for r, pid in gui.active_buttons:
+                        if r.collidepoint(e.pos):
+                            if pid in STATE.incoming_ids: client.accept_connection(pid)
+                            else: 
+                                t = client.peers[pid]
+                                client.connect_manual(t['ip'], t['port'], t['name'])
+        gui.update(); gui.draw(screen, font, font_ui, client)
+        pygame.display.flip(); await asyncio.sleep(0.01)
 
-        gui.update()
-        gui.draw(screen, font, font_ui, client)
-        pygame.display.flip()
-        await asyncio.sleep(0.01)
-
-    client.save_sessions_to_disk()
+    await client.stop()
+    client.save_sessions_securely()
     pygame.quit()
 
 if __name__ == "__main__":
