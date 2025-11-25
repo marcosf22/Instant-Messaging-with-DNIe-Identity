@@ -3,12 +3,15 @@ import sys
 import socket
 import threading
 import queue
+import json
+import os
 import struct
 
 from crypto import KeyManager, SessionCrypto
 from protocol import ChatProtocol, MSG_HELLO, MSG_DATA, MSG_DISCOVERY
 
 PORT = 8888 
+SESSION_FILE = "sessions.json"
 
 def get_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -23,13 +26,40 @@ class ChatClient:
         self.loop = asyncio.get_running_loop()
         self.my_ip = get_ip()
         
-        self.km = KeyManager(name)
+        # Gestor de claves (ahora con sesión persistente)
+        try: self.km = KeyManager(name)
+        except: sys.exit(1)
+
         self.sessions = {}        
         self.peers = {}           
         self.proto = ChatProtocol(self.on_packet)
+        self.load_sessions()
+
+    # --- PERSISTENCIA ---
+    def load_sessions(self):
+        if not os.path.exists(SESSION_FILE): return
+        try:
+            with open(SESSION_FILE,'r') as f: data = json.load(f)
+            for ip, hx in data.items():
+                s = SessionCrypto(None); s.load_secret(hx)
+                self.sessions[ip] = s
+        except: pass
+    
+    def save_sessions(self):
+        d = {ip: s.export_secret() for ip, s in self.sessions.items() if s.export_secret()}
+        try: 
+            with open(SESSION_FILE,'w') as f: json.dump(d, f)
+        except: pass
+
+    # --- INICIO ---
+    def iniciar_dnie(self):
+        """Llama al login bloqueante antes de empezar nada"""
+        if not self.km.iniciar_sesion_dnie():
+            print("❌ No se pudo iniciar sesión con el DNIe. Saliendo.")
+            sys.exit(1)
 
     async def start(self):
-        print(f"--- CHAT DNIe SEGURO EN {self.my_ip}:{PORT} ---")
+        print(f"\n--- CHAT ACTIVO EN {self.my_ip}:{PORT} ---")
         self.trans, _ = await self.loop.create_datagram_endpoint(
             lambda: self.proto, local_addr=("0.0.0.0", PORT), allow_broadcast=True
         )
@@ -46,115 +76,20 @@ class ChatClient:
             except: pass
             await asyncio.sleep(3)
 
-    # --- LÓGICA DE FIRMA EN HILO APARTE (Para no congelar red) ---
-    def _firmar_y_enviar_hello(self, ip_destino):
-        """Esta función se ejecuta en segundo plano para pedir el PIN"""
-        try:
-            # 1. Crear sesión criptográfica temporal
-            session = SessionCrypto()
-            mi_clave_temp = session.get_public_bytes()
-            
-            # 2. FIRMAR CON DNIe (Bloqueante)
-            # Pedirá el PIN aquí
-            cert, firma = self.km.firmar_handshake(mi_clave_temp)
-            
-            if not cert or not firma:
-                print("❌ Cancelado por usuario.")
-                return
-
-            # 3. Empaquetar: [LenCert + Cert + LenFirma + Firma + ClaveTemp]
-            payload = struct.pack("!I", len(cert)) + cert + \
-                      struct.pack("!I", len(firma)) + firma + \
-                      mi_clave_temp
-            
-            # 4. Enviar
-            # Usamos call_soon_threadsafe para volver al hilo principal y enviar
-            self.loop.call_soon_threadsafe(
-                self.proto.send_packet, ip_destino, PORT, MSG_HELLO, 0, payload
-            )
-            
-            # 5. Guardar sesión pendiente (esperando respuesta o confirmación)
-            # Como estamos en otro hilo, protegemos el acceso al dict
-            self.sessions[ip_destino] = session 
-            print("📤 Handshake firmado enviado. Esperando verificación del otro...")
-            
-        except Exception as e:
-            print(f"❌ Error firmando: {e}")
-
+    # --- FIRMA Y ENVÍO ---
     def iniciar_conexion_segura(self, ip):
-        print(f"\n🔐 Iniciando Handshake con {ip}...")
-        print("⚠️ Prepara tu DNIe. Se abrirá la petición de PIN.")
-        # Ejecutamos la firma en un hilo para no bloquear el chat
-        threading.Thread(target=self._firmar_y_enviar_hello, args=(ip,), daemon=True).start()
+        print(f"\n🔐 Firmando handshake con DNIe (Sesión abierta)...")
+        # Ahora esto es rápido, pero usamos thread para no bloquear si el chip tarda
+        threading.Thread(target=self._firmar_y_enviar, args=(ip,), daemon=True).start()
 
-
-    # --- RECEPCIÓN DE PAQUETES ---
-    def on_packet(self, pkt, addr):
-        ip = addr[0]
-        if ip == self.my_ip: return
-
-        if pkt.msg_type == MSG_DISCOVERY:
-            if ip not in [p['ip'] for p in self.peers.values()]:
-                self.peers[len(self.peers)] = {'ip': ip, 'name': pkt.payload}
-                print(f"\n🔭 Encontrado: {pkt.payload} ({ip})")
-
-        elif pkt.msg_type == MSG_HELLO:
-            # ALGUIEN NOS MANDA SU CLAVE FIRMADA
-            print(f"\n📨 Recibido Handshake firmado de {ip}. Verificando...")
-            
-            # 1. Desempaquetar
-            try:
-                data = pkt.payload
-                off = 0
-                l_cert = struct.unpack("!I", data[off:off+4])[0]; off+=4
-                cert = data[off:off+l_cert]; off+=l_cert
-                l_sig = struct.unpack("!I", data[off:off+4])[0]; off+=4
-                sig = data[off:off+l_sig]; off+=l_sig
-                clave_temp_otro = data[off:]
-                
-                # 2. VERIFICAR FIRMA
-                valido, nombre_dnie = self.km.verificar_handshake(clave_temp_otro, cert, sig)
-                
-                if not valido:
-                    print(f"⛔ ALERTA: Firma inválida de {ip}. Error: {nombre_dnie}")
-                    return
-
-                print(f"✅ IDENTIDAD VERIFICADA: {nombre_dnie}")
-                print(f"   (El DNIe confirma que esta clave es suya)")
-
-                # 3. Establecer Sesión
-                # Si yo inicié (ya tengo sesión creada), calculo secreto
-                if ip in self.sessions and self.sessions[ip].cipher is None:
-                    self.sessions[ip].compute_secret(clave_temp_otro)
-                    print(f"🤝 Canal cifrado establecido con {nombre_dnie}")
-                
-                # Si yo soy el receptor (no tengo sesión), debo RESPONDER
-                elif ip not in self.sessions:
-                    print(f"👉 Debes responder para completar la conexión.")
-                    # Aceptamos automáticamente la parte criptográfica
-                    s = SessionCrypto()
-                    s.compute_secret(clave_temp_otro)
-                    self.sessions[ip] = s
-                    
-                    # PERO AHORA DEBO FIRMAR MI CLAVE PARA ENVIARSELA
-                    print("⚠️ Te toca firmar tu parte. Introduce PIN...")
-                    threading.Thread(target=self._responder_handshake, args=(ip, s), daemon=True).start()
-
-            except Exception as e:
-                print(f"❌ Error procesando handshake: {e}")
-
-        elif pkt.msg_type == MSG_DATA:
-            if ip in self.sessions and self.sessions[ip].cipher:
-                try:
-                    msg = self.sessions[ip].decrypt(pkt.payload)
-                    print(f"\r[{ip}]: {msg}\nTú > ", end="")
-                except: print("\n⚠️ Error desencriptando.")
-
-    def _responder_handshake(self, ip, session):
-        # Función auxiliar para responder (similar a iniciar pero con la sesión ya creada)
+    def _firmar_y_enviar(self, ip):
         try:
+            session = SessionCrypto()
             mi_clave = session.get_public_bytes()
+            
+            # ¡YA NO PIDE PIN! USA LA SESIÓN DEL INICIO
             cert, firma = self.km.firmar_handshake(mi_clave)
+            
             if not cert: return
             
             payload = struct.pack("!I", len(cert)) + cert + \
@@ -164,32 +99,104 @@ class ChatClient:
             self.loop.call_soon_threadsafe(
                 self.proto.send_packet, ip, PORT, MSG_HELLO, 0, payload
             )
-            print("📤 Respuesta firmada enviada. Chat Listo.")
+            self.sessions[ip] = session
+            print("📤 Solicitud firmada enviada.")
+        except Exception as e:
+            print(f"❌ Error firma: {e}")
+
+    # --- PACKETS ---
+    def on_packet(self, pkt, addr):
+        ip = addr[0]
+        if ip == self.my_ip: return
+
+        if pkt.msg_type == MSG_DISCOVERY:
+            if ip not in [p['ip'] for p in self.peers.values()]:
+                self.peers[len(self.peers)] = {'ip': ip, 'name': pkt.payload}
+                print(f"\n🔭 Detectado: {pkt.payload}")
+
+        elif pkt.msg_type == MSG_HELLO:
+            print(f"\n📨 Recibido Handshake de {ip}. Verificando...")
+            try:
+                data = pkt.payload
+                off = 0
+                l_c = struct.unpack("!I", data[off:off+4])[0]; off+=4
+                cert = data[off:off+l_c]; off+=l_c
+                l_s = struct.unpack("!I", data[off:off+4])[0]; off+=4
+                sig = data[off:off+l_s]; off+=l_s
+                clave_otro = data[off:]
+                
+                valido, nombre = self.km.verificar_handshake(clave_otro, cert, sig)
+                if not valido: return print(f"⛔ FIRMA FALSA: {nombre}")
+
+                print(f"✅ VERIFICADO: {nombre}")
+                
+                # Crear sesión
+                if ip in self.sessions and self.sessions[ip].cipher: # Ya teníamos sesión
+                     # Renegociación: actualizamos clave
+                     self.sessions[ip].compute_secret(clave_otro)
+                else:
+                    # Nueva sesión: Calculamos y RESPONDEMOS
+                    s = SessionCrypto()
+                    s.compute_secret(clave_otro)
+                    self.sessions[ip] = s
+                    threading.Thread(target=self._responder, args=(ip, s), daemon=True).start()
+                    self.save_sessions()
+
+            except Exception as e: print(f"❌ Error: {e}")
+
+        elif pkt.msg_type == MSG_DATA:
+            if ip in self.sessions and self.sessions[ip].cipher:
+                try:
+                    msg = self.sessions[ip].decrypt(pkt.payload)
+                    print(f"\r[{ip}]: {msg}\nTú > ", end="")
+                except: 
+                    print("\n♻️ Clave caducada. Reconectando...")
+                    self.iniciar_conexion_segura(ip)
+
+    def _responder(self, ip, session):
+        try:
+            mi_clave = session.get_public_bytes()
+            # FIRMA RÁPIDA (SIN PIN)
+            cert, firma = self.km.firmar_handshake(mi_clave)
+            if not cert: return
+            payload = struct.pack("!I", len(cert)) + cert + \
+                      struct.pack("!I", len(firma)) + firma + \
+                      mi_clave
+            self.loop.call_soon_threadsafe(
+                self.proto.send_packet, ip, PORT, MSG_HELLO, 0, payload
+            )
+            print("📤 Respuesta enviada. Chat Listo.")
         except: pass
 
 async def main():
-    c = ChatClient("Yo")
+    name = sys.argv[1] if len(sys.argv)>1 else input("Tu nombre: ")
+    c = ChatClient(name)
+    
+    # --- AQUÍ ESTÁ EL CAMBIO IMPORTANTE ---
+    # Pedimos el PIN antes de arrancar nada
+    c.iniciar_dnie() 
+    # --------------------------------------
+
     await c.start()
     
     q = queue.Queue()
     threading.Thread(target=lambda: [q.put(sys.stdin.readline().strip()) for _ in iter(int,1)], daemon=True).start()
 
-    print("--- CHAT DNIe (PIN REQUERIDO EN CADA CONEXIÓN) ---")
-    print("Usa: /connect ID")
+    print("--- CHAT SEGURO (Sesión DNIe Abierta) ---")
+    print("Comandos: /connect ID, /list, /quit")
     print("(Lobby) > ", end="")
 
     while True:
         while not q.empty():
             msg = q.get()
+            if msg == "/quit": c.save_sessions(); return
             if msg.startswith("/connect"): 
-                try: 
-                    pid = int(msg.split()[1])
-                    c.iniciar_conexion_segura(c.peers[pid]['ip'])
+                try: c.iniciar_conexion_segura(c.peers[int(msg.split()[1])]['ip'])
                 except: print("ID Mal")
             elif msg == "/list": 
                  for k,v in c.peers.items(): print(f"{k}: {v['name']}")
             else:
-                # Enviar chat si hay sesión activa (primer peer encontrado con cipher)
+                # Buscar sesión activa
                 target = None
                 for ip, s in c.sessions.items():
                     if s.cipher: target = ip; break
@@ -198,7 +205,7 @@ async def main():
                     enc = c.sessions[target].encrypt(msg)
                     c.proto.send_packet(target, PORT, MSG_DATA, 0, enc)
                     print("Tú > ", end="")
-                else:
+                else: 
                     if msg: print("⛔ No conectado.")
         await asyncio.sleep(0.1)
 
