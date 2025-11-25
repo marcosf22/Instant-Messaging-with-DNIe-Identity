@@ -15,7 +15,6 @@ PORT = 8888
 SESSION_FILE = "sessions.json"
 
 def get_best_ip():
-    """Obtiene la IP local de salida (WiFi, Ethernet o VPN)"""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(('8.8.8.8', 1)) 
@@ -32,7 +31,6 @@ class ChatClient:
         self.loop = asyncio.get_running_loop()
         self.my_ip = get_best_ip()
         
-        # Calcular dirección de Broadcast
         try:
             parts = self.my_ip.split('.')
             self.broadcast_addr = f"{parts[0]}.{parts[1]}.{parts[2]}.255"
@@ -42,7 +40,6 @@ class ChatClient:
         print(f"--> Mi IP: {self.my_ip}")
         print(f"--> Broadcast Target: {self.broadcast_addr}")
 
-        # Cargar Identidad (DNIe / X25519)
         try:
             self.key_manager = KeyManager(f"{name}_identity")
         except Exception as e:
@@ -58,48 +55,38 @@ class ChatClient:
         self.protocol = ChatProtocol(self.on_packet)
         self.transport = None
         
-        # Cargar sesiones guardadas al iniciar
         self.load_sessions_from_disk()
 
-    # --- PERSISTENCIA (GUARDAR Y CARGAR) ---
+    # --- PERSISTENCIA ---
     def load_sessions_from_disk(self):
-        if not os.path.exists(SESSION_FILE):
-            return
-
+        if not os.path.exists(SESSION_FILE): return
         try:
             with open(SESSION_FILE, 'r') as f:
                 saved_data = json.load(f)
             
             count = 0
             for ip, hex_key in saved_data.items():
-                # Reconstruimos la sesión con la clave guardada
                 session = SessionCrypto(self.key_manager.static_private)
                 try:
                     session.load_secret(hex_key)
                     self.sessions[ip] = session
                     count += 1
-                except Exception:
-                    pass # Ignoramos claves corruptas
+                except: pass
             
-            if count > 0:
-                print(f"💾 {count} sesiones recuperadas del disco.")
-        except Exception as e:
-            print(f"⚠️ Error leyendo sessions.json: {e}")
+            if count > 0: print(f"💾 {count} sesiones recuperadas del disco.")
+        except Exception as e: print(f"⚠️ Error leyendo sessions.json: {e}")
 
     def save_sessions_to_disk(self):
         data_to_save = {}
         for ip, session in self.sessions.items():
             key_hex = session.export_secret()
-            if key_hex:
-                data_to_save[ip] = key_hex
-        
+            if key_hex: data_to_save[ip] = key_hex
         try:
             with open(SESSION_FILE, 'w') as f:
                 json.dump(data_to_save, f, indent=4)
-        except Exception as e:
-            print(f"❌ Error guardando sesiones: {e}")
+        except Exception as e: print(f"❌ Error guardando sesiones: {e}")
 
-    # --- RED Y DISCOVERY ---
+    # --- RED ---
     async def start(self):
         print(f"--- CHAT INICIADO EN PUERTO {PORT} ---")
         self.transport, _ = await self.loop.create_datagram_endpoint(
@@ -110,31 +97,23 @@ class ChatClient:
         self.loop.create_task(self.beacon_loop())
 
     async def beacon_loop(self):
-        """Envía señal de vida cada 3 segundos"""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        try:
-            sock.bind((self.my_ip, 0))
+        try: sock.bind((self.my_ip, 0))
         except: pass
-
         msg = f"DISCOVERY:{self.name}".encode('utf-8')
-
         while True:
-            try:
-                sock.sendto(msg, (self.broadcast_addr, PORT))
+            try: sock.sendto(msg, (self.broadcast_addr, PORT))
             except: pass
             await asyncio.sleep(3)
 
-    # --- INTERFAZ DE USUARIO ---
+    # --- INTERFAZ ---
     def show_peers(self):
         print("\n" + "="*30)
         print(" 👥  CONTACTOS DISPONIBLES")
         print("="*30)
-        
         for pid, d in self.peers.items():
-            status = ""
-            if d['ip'] in self.sessions:
-                status = " [🔐 Guardado]"
+            status = " [🔐 Guardado]" if d['ip'] in self.sessions else ""
             print(f"   [{pid}]  {d['name']:<15} {status}")
         
         if self.pending_requests:
@@ -158,7 +137,6 @@ class ChatClient:
         print("(Lobby) > ", end="", flush=True)
 
     def accept_connection(self, peer_id):
-        """Acepta una solicitud pendiente"""
         if peer_id not in self.peers:
             print("❌ ID incorrecto.")
             return
@@ -171,8 +149,9 @@ class ChatClient:
             return
         
         handshake_payload = self.pending_requests[ip]
-        
         print(f"✅ Aceptando a {name}...")
+        
+        # Crear sesión y responder
         session = SessionCrypto(self.key_manager.static_private)
         self.sessions[ip] = session
         
@@ -184,17 +163,14 @@ class ChatClient:
             
             self.target_ip = ip
             del self.pending_requests[ip]
-            
-            # GUARDAR AL ACEPTAR
             self.save_sessions_to_disk()
             
             print(f"\n✨ CONEXIÓN ESTABLECIDA.")
             print("Tú > ", end="", flush=True)
-
         except Exception as e:
             print(f"❌ Error al aceptar: {e}")
 
-    # --- LÓGICA DE PAQUETES (Aquí está la magia) ---
+    # --- LÓGICA DE PAQUETES ---
     def on_packet(self, packet, addr):
         ip = addr[0]
         if ip == self.my_ip: return 
@@ -213,17 +189,24 @@ class ChatClient:
 
         # 2. HANDSHAKE (HELLO)
         if packet.msg_type == MSG_HELLO:
-            # Si ya tenemos sesión, asumimos renegociación silenciosa
+            # CASO A: Ya tenemos sesión (puede ser una respuesta a nuestro connect)
             if ip in self.sessions:
                 try:
                     self.sessions[ip].perform_handshake(packet.payload, is_initiator=True)
                     self.save_sessions_to_disk()
-                except: pass
+                    
+                    # --- ESTO ES LO QUE FALTABA ---
+                    # Si recibimos el handshake y nosotros iniciamos la conexión, avisamos.
+                    print(f"\n✅ ¡CONEXIÓN COMPLETADA CON {ip}!")
+                    print(f"   Ya podéis hablar de forma segura.")
+                    print("Tú > ", end="", flush=True)
+                except Exception as e:
+                    print(f"\n❌ Error finalizando handshake con {ip}: {e}")
                 return
 
+            # CASO B: Solicitud nueva
             if ip not in self.pending_requests:
                 self.pending_requests[ip] = packet.payload
-                # Avisar al usuario
                 name = ip
                 pid_found = "?"
                 for pid, d in self.peers.items():
@@ -236,13 +219,11 @@ class ChatClient:
                 prompt = "Tú > " if self.target_ip else "(Lobby) > "
                 print(prompt, end="", flush=True)
 
-        # 3. MENSAJES DE CHAT (DATA)
+        # 3. CHAT (DATA)
         elif packet.msg_type == MSG_DATA:
             if ip in self.sessions:
                 try:
                     msg = self.sessions[ip].decrypt(packet.payload)
-                    
-                    # Mostrar mensaje bonito
                     name = ip
                     for p in self.peers.values():
                         if p['ip'] == ip: name = p['name']
@@ -257,56 +238,51 @@ class ChatClient:
                         print("(Lobby) > ", end="", flush=True)
 
                 except Exception: 
-                    # --- AQUÍ ESTÁ EL ARREGLO DE AUTO-RECUPERACIÓN ---
                     print(f"\n♻️ La clave antigua con {ip} no funciona. Renegociando...")
-                    
-                    # 1. Borramos la clave mala de memoria
                     del self.sessions[ip]
-                    
-                    # 2. Guardamos el cambio (se borra del json)
                     self.save_sessions_to_disk()
-                    
-                    # 3. Pedimos conectar de nuevo automáticamente
                     self.connect_manual(ip)
             else:
-                # Si llega mensaje sin sesión, pedimos conectar
                 print(f"\n⚠️ Mensaje ilegible de {ip}. Reconectando...")
                 self.connect_manual(ip)
 
     def connect_manual(self, ip_target):
-        # Si tenemos clave guardada, la usamos directo
         if ip_target in self.sessions:
             print(f"✅ Usando clave guardada con {ip_target}...")
             self.target_ip = ip_target
             print("Chat restaurado. Escribe.")
             return
 
-        # Si no, protocolo completo
         print(f"--> Enviando solicitud a {ip_target}...")
         session = SessionCrypto(self.key_manager.static_private)
         self.sessions[ip_target] = session
-        my_key = session.get_ephemeral_public_bytes()
-        for _ in range(3):
-            self.protocol.send_packet(ip_target, PORT, MSG_HELLO, 0, my_key)
         
-        self.target_ip = ip_target
-        print("⏳ Esperando que acepte...")
+        try:
+            # Generamos nuestra clave pública efímera
+            my_key = session.get_ephemeral_public_bytes()
+            for _ in range(3):
+                self.protocol.send_packet(ip_target, PORT, MSG_HELLO, 0, my_key)
+            
+            self.target_ip = ip_target
+            print("⏳ Esperando que acepte...")
+        except Exception as e:
+            print(f"❌ Error iniciando crypto: {e}")
+            del self.sessions[ip_target]
 
     def send_chat(self, text):
         if self.target_ip and self.target_ip in self.sessions:
             try:
                 enc = self.sessions[self.target_ip].encrypt(text)
                 self.protocol.send_packet(self.target_ip, PORT, MSG_DATA, 1, enc)
-            except: pass
+            except Exception as e:
+                print(f"❌ No se pudo enviar (¿Falta handshake?): {e}")
         else:
-            print("⛔ No conectado.")
+            print("⛔ No conectado o handshake incompleto.")
 
-# --- BUCLE PRINCIPAL ---
+# --- MAIN ---
 async def main():
-    if len(sys.argv) > 1:
-        name = sys.argv[1]
-    else:
-        name = input("Tu nombre: ")
+    if len(sys.argv) > 1: name = sys.argv[1]
+    else: name = input("Tu nombre: ")
     
     client = ChatClient(name)
     await client.start()
@@ -331,8 +307,7 @@ async def main():
             if msg == "/quit": 
                 client.save_sessions_to_disk()
                 return
-            elif msg == "/leave": 
-                client.disconnect_current()
+            elif msg == "/leave": client.disconnect_current()
             
             elif msg.startswith("/connect"):
                 parts = msg.split()
@@ -360,7 +335,7 @@ async def main():
                     print("Tú > ", end="", flush=True)
                 else:
                     if msg.strip():
-                        print("⛔ Lobby: Usa /connect <ID>")
+                        print("⛔ Estás en el Lobby. Usa /connect <ID>")
                         print("(Lobby) > ", end="", flush=True)
         
         await asyncio.sleep(0.1)
