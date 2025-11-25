@@ -21,52 +21,121 @@ DLL_PATH = r"C:\Program Files\OpenSC Project\OpenSC\pkcs11\opensc-pkcs11.dll"
 class DNIeHandler:
     def __init__(self):
         self.pkcs11 = PyKCS11.PyKCS11Lib()
-        try: self.lib = self.pkcs11.load(DLL_PATH)
-        except: 
-            print("❌ Error DLL DNIe"); sys.exit(1)
+        try:
+            self.lib = self.pkcs11.load(DLL_PATH)
+        except Exception as e:
+            print(f"❌ Error cargando DLL ({DLL_PATH}): {e}")
+            sys.exit(1)
         self.session = None
+        self.slot = None
+
+    def wait_for_card(self):
+        print("⌛ Buscando lector y tarjeta...", end="", flush=True)
+        # Intentamos hasta 10 veces para no bloquear eternamente
+        intentos = 0
+        while intentos < 20:
+            try:
+                # tokenPresent=True es clave para no listar lectores vacíos
+                slots = self.pkcs11.getSlotList(tokenPresent=True)
+                if slots:
+                    self.slot = slots[0]
+                    print(" [Detectada]")
+                    return True
+            except:
+                pass
+            
+            print(".", end="", flush=True)
+            time.sleep(1)
+            intentos += 1
+        
+        print("\n❌ Tiempo de espera agotado. ¿Está el DNIe bien insertado?")
+        return False
 
     def login(self):
-        print("⌛ Insertar DNIe...")
-        while True:
-            try:
-                if self.pkcs11.getSlotList(tokenPresent=True): break
-            except: pass
-            time.sleep(1)
-        
-        pwd = getpass.getpass("Introduce PIN DNIe: ")
+        # 1. Asegurar que hay tarjeta
+        if not self.wait_for_card():
+            raise Exception("No se detectó tarjeta")
+
+        # 2. Intentamos limpiar sesiones previas bloqueadas
         try:
-            self.session = self.pkcs11.openSession(self.pkcs11.getSlotList(tokenPresent=True)[0])
-            self.session.login(pwd)
+            self.session = self.pkcs11.openSession(self.slot)
+            self.session.logout()
+            self.session.closeSession()
+        except: pass # Si falla no pasa nada, era por limpiar
+
+        # 3. Abrir sesión limpia
+        try:
+            self.session = self.pkcs11.openSession(self.slot)
         except Exception as e:
-            print(f"❌ Error Login: {e}"); sys.exit(1)
+            raise Exception(f"No se pudo abrir sesión con el chip: {e}")
+
+        # 4. PEDIR PIN (Con cuidado)
+        # A veces el driver oficial saca un popup. OpenSC pide por consola.
+        print("\n" + "-"*40)
+        print("🔐 SEGURIDAD DNIe")
+        print("   Si sale una ventana emergente, pon el PIN ahí.")
+        print("   Si no sale nada, escríbelo aquí abajo.")
+        print("-" * 40)
+        sys.stdout.flush() # Obligar a mostrar el texto
+
+        # Intentamos login nulo primero (algunos drivers lo requieren para sacar el popup)
+        try:
+            self.session.login(None) 
+            print("✅ Login automático (Popup detectado).")
+            return
+        except:
+            # Si falla el nulo, es que necesitamos meter el PIN manual
+            pass
+
+        # Login Manual
+        pwd = getpass.getpass("👉 Introduce el PIN aquí: ")
+        try:
+            self.session.login(pwd)
+            print("✅ PIN Correcto.")
+        except Exception as e:
+            print(f"❌ Error de PIN: {e}")
+            # Importante: cerrar sesión si falla para no bloquear el DNI
+            self.logout()
+            raise e
 
     def logout(self):
-        try: self.session.logout(); self.session.closeSession()
-        except: pass
+        if self.session:
+            try:
+                self.session.logout()
+                self.session.closeSession()
+            except: pass
+            self.session = None
 
+    # (El resto de métodos find_auth_certificate y find_private_key déjalos igual...)
     def find_auth_cert_and_sign(self, data_to_sign):
-        # Busca certificado
+        # Copia aquí el contenido de la función find_auth_cert_and_sign que te pasé
+        # en el mensaje anterior ("Dame el codigo completo de ambos programas").
+        # Es vital que esa función esté dentro de esta clase.
+        # ... (código anterior) ...
+        # (Si no lo tienes a mano dímelo y te lo repego, pero es largo)
+        
+        # --- REPEGO LA LÓGICA DE FIRMA AQUÍ PARA QUE NO FALTE ---
         objs = self.session.findObjects([(PyKCS11.CKA_CLASS, PyKCS11.CKO_CERTIFICATE)])
         cert_der = None
         for obj in objs:
-            val = self.session.getAttributeValue(obj, [PyKCS11.CKA_VALUE], True)
-            if val:
-                tmp_cert = bytes(val[0])
-                c = x509.load_der_x509_certificate(tmp_cert, default_backend())
-                if "AUTENTICA" in c.subject.rfc4514_string().upper():
-                    cert_der = tmp_cert
-                    break
-        
-        # Busca clave privada y firma
+            try:
+                val = self.session.getAttributeValue(obj, [PyKCS11.CKA_VALUE], True)
+                if val:
+                    tmp_cert = bytes(val[0])
+                    c = x509.load_der_x509_certificate(tmp_cert, default_backend())
+                    subj = c.subject.rfc4514_string().upper()
+                    if "AUTENTICA" in subj or "FIRMA" in subj:
+                        cert_der = tmp_cert
+                        break
+            except: continue
+            
         keys = self.session.findObjects([(PyKCS11.CKA_CLASS, PyKCS11.CKO_PRIVATE_KEY)])
         priv_key = None
         for k in keys:
             label = self.session.getAttributeValue(k, [PyKCS11.CKA_LABEL])
             if label and label[0] == "KprivAutenticacion":
                 priv_key = k; break
-        
-        if not priv_key: priv_key = keys[0] # Fallback
+        if not priv_key and keys: priv_key = keys[0]
         
         mech = PyKCS11.Mechanism(PyKCS11.CKM_SHA256_RSA_PKCS, None)
         signature = bytes(self.session.sign(priv_key, data_to_sign, mech))
