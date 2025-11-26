@@ -67,36 +67,10 @@ Una vez tenemos el directorio con los elementos necesarios tenemos que realizar 
 pip install pygame zeroconf cryptography python-pyscard pykcs11 pillow
 ```
 
-
-<p align="center">
-  <img src="./images/AGENTE.png" alt="Captura de pantalla 1" width="400"/>
+<p align="left">
+  <img src="./images/directorio.png" alt="Captura de pantalla 1" width="200"/>
 </p>
 
-### 3. Modificar correo
+---
 
-Para que los mensajes lleguen correctamente, tienes que obtener un token de aplicación para habilitar el envío automático desde el programa python.
-
-<p align="center">
-  <img src="./images/correo.png" alt="Captura de pantalla 1" width="400"/>
-</p>
-
-### 4. Ejecución
-
-1.  Instalar librería pysnmp:
-    ```bash
-    pip install pysnmp==7.1.4
-    ```
-2.  Navega al directorio del proyecto:
-    ```bash
-    cd mini-agent
-    ```
-3.  Inicia el mini_agent:
-    ```bash
-    python mini_agent.py
-    ```
-4.  Inicia el administrador/tester:
-    ```bash
-    python test_agent.py
-    ```
-
-
+## 🎮 Guía de Uso
