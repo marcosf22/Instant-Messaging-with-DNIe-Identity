@@ -1,5 +1,14 @@
-import asyncio, sys, socket, json, os, threading, zlib, struct, uuid, base64, pygame, time
-
+import asyncio
+import sys
+import socket
+import json
+import os
+import zlib
+import struct
+import uuid
+import base64
+import pygame
+import time
 from datetime import datetime
 from PIL import Image as PILImage, ImageSequence
 
@@ -28,7 +37,7 @@ BTN_IDLE    = (20, 40, 20)
 BTN_HOVER   = (40, 80, 40)
 BTN_ACTIVE  = (0, 100, 0)
 BTN_ALERT   = (180, 100, 0)
-BTN_VERIFIED= (218, 165, 32)
+BTN_VERIFIED= (0, 80, 100)
 BTN_OFFLINE = (50, 50, 50)
 
 SESSION_FILE = "sessions.json"
@@ -84,7 +93,6 @@ class CodecCharacterLoader:
     def __init__(self):
         self.chars = {}; self.keys = []
         self.load()
-        
     def load(self):
         f = resource_path(os.path.join("assets", "characters"))
         if not os.path.exists(f): os.makedirs(f, exist_ok=True)
@@ -96,11 +104,14 @@ class CodecCharacterLoader:
                 frames = load_gif_frames(resource_path(os.path.join(f, file)), (150,200))
                 if frames: self.chars[file.split('.')[0].lower()] = frames
         self.keys = sorted(list(self.chars.keys()))
-
     def get(self, uid):
-        if uid in self.chars: return self.chars[uid]
-        uid_us = uid.replace(" ", "_")
-        if uid_us in self.chars: return self.chars[uid_us]
+        # 1. Búsqueda Directa: ¿Tenemos un gif con este nombre?
+        # (uid llega en minúsculas desde _draw_face)
+        if uid in self.chars:
+            return self.chars[uid]
+
+        # 2. Fallback: Si no existe el gif específico, usa el hash 
+        # para asignar uno aleatorio pero consistente (para que no salga vacío).
         if not self.keys: return self.chars['default']
         return self.chars[self.keys[zlib.crc32(str(uid).encode()) % len(self.keys)]]
 
@@ -130,10 +141,9 @@ class AppState:
         self.messages.append(msg_obj)
         
         if not is_sys:
-            clean_snd = snd.split(" [")[0].lower()
-            
+            # FIX: Limpiar nombre para el timer de animación
+            clean_snd = snd.split(" [")[0].strip().lower()
             self.talking_timer[clean_snd] = pygame.time.get_ticks() + 2500
-            
             if not is_me: self.sound_queue.append("msg")
         return msg_obj
 
@@ -226,33 +236,49 @@ class ChatClient:
             self.chat_histories[sk].append(msg_obj)
         self.save_sessions_securely() 
 
+    # --- NUEVO WORKER DE REINTENTOS ---
+    async def retry_worker(self):
+        """Reintenta enviar mensajes en cola cada 5s si hay conexión"""
+        while True:
+            now = time.time()
+            for sk in list(self.message_queue.keys()):
+                if sk in self.offline_peers: continue
+                
+                queue = self.message_queue[sk]
+                if not queue: continue
+                
+                # Parsear IP/Port
+                try: ip, port = sk.split(':'); port = int(port)
+                except: continue
+                
+                # Si no hay sesión crypto, no podemos enviar aún
+                if sk not in self.sessions: continue
+
+                for item in queue:
+                    if now - item.get('last_try', 0) > 5:
+                        try:
+                            payload = json.dumps({"id": item['id'], "msg": item['text']})
+                            enc = self.sessions[sk].encrypt(payload)
+                            self.protocol.send_packet(ip, port, MSG_DATA, 1, enc)
+                            
+                            item['last_try'] = now
+                            
+                            # Actualizar estado visual a 'sent' (un tick)
+                            if item['status'] == 'queued':
+                                item['status'] = 'sent'
+                                STATE.mark_sent(item['id'])
+                                # Actualizar historial persistente
+                                self.save_msg_to_history(sk, item)
+                        except: pass
+            await asyncio.sleep(1)
+
     # Envíamos los mensajes que estén pendientes.
     def flush_queue(self, ip, port):
         sk = f"{ip}:{port}"
-        if sk in self.message_queue and self.message_queue[sk]:
-            pending = self.message_queue[sk]
-            count = len(pending)
-
-            still_pending = []
-            for msg_data in pending:
-                try:
-                    payload = json.dumps({"id": msg_data['id'], "msg": msg_data['text']})
-                    enc = self.sessions[sk].encrypt(payload)
-                    self.protocol.send_packet(ip, port, MSG_DATA, 1, enc)
-
-                    STATE.mark_sent(msg_data['id'])
-
-                    msg_data['status'] = 'sent'
-                    self.save_msg_to_history(sk, msg_data)
-                    
-                except Exception as e:
-                    still_pending.append(msg_data)
-            
-            if not still_pending:
-                del self.message_queue[sk]
-            else:
-                self.message_queue[sk] = still_pending
-
+        if sk in self.message_queue:
+            # Resetear timers para que el worker los coja YA
+            for m in self.message_queue[sk]: m['last_try'] = 0
+            # STATE.add_message("SYS", f"📤 Sincronizando cola...", True)
 
     # Función que nos permite agestionar los "reencuentros".
     def update_contacts(self, action, name, info):
@@ -287,7 +313,6 @@ class ChatClient:
                     if k not in self.sessions:
                         STATE.sound_queue.append("contact")
 
-
                 # Si ya lo teníamos guardado, hacemos un saludo pero sin todo el handshake.
                 if k in self.sessions:
                     self.perform_background_reconnect(ip, port)
@@ -319,17 +344,20 @@ class ChatClient:
             c = 0
             for sk, entry in data.items():
                 hex_key = entry if isinstance(entry, str) else entry.get('key')
-                s = SessionCrypto()
+                s = SessionCrypto() # FIX: Sin args
                 try: 
                     s.load_secret(hex_key)
                     self.sessions[sk] = s
                     c += 1
                     if isinstance(entry, dict):
                         self.chat_histories[sk] = entry.get('history', [])
+                        # Cargar cola
+                        if 'queue' in entry: self.message_queue[sk] = entry['queue']
+
                         vname = entry.get('verified_name')
                         self.verified_users[sk] = vname if vname else ""
                 except: pass
-            if c > 0: STATE.add_message("SYS", f"{c} chats recuperados.", True)
+            if c > 0: STATE.add_message("SYS", f"💾 {c} chats recuperados.", True)
         except: pass
 
 
@@ -338,9 +366,16 @@ class ChatClient:
         export_data = {}
         for sk, s in self.sessions.items():
             if s.export_secret():
+                # Guardar cola limpia
+                q = []
+                if sk in self.message_queue:
+                     for m in self.message_queue[sk]:
+                         q.append({'id': m['id'], 'text': m['text'], 'status': m['status']})
+
                 export_data[sk] = {
                     'key': s.export_secret(),
                     'history': self.chat_histories.get(sk, []),
+                    'queue': q,
                     'verified_name': self.verified_users.get(sk, "") 
                 }
         try: 
@@ -359,6 +394,7 @@ class ChatClient:
             lambda: self.protocol, local_addr=("0.0.0.0", self.port), allow_broadcast=True
         )
         await self.discovery.start()
+        self.loop.create_task(self.retry_worker())
 
 
     # Cerramos el transporte y envíamos un mensaje de que estamos OFFLINE.
@@ -382,6 +418,7 @@ class ChatClient:
     def _firmar_y_enviar(self):
         try:
             key_sess = f"{STATE.target_info[0]}:{STATE.target_info[1]}"
+            # FIX: get_public_bytes
             clave_pub = self.sessions[key_sess].get_public_bytes()
             cert, firma = self.key_manager.firmar_handshake(clave_pub)
             if not cert: return
@@ -474,6 +511,12 @@ class ChatClient:
                     mid = d.get("id")
                     if mid:
                         STATE.mark_ack(mid)
+                        
+                        # BORRAR DE COLA (YA LLEGÓ)
+                        if sk in self.message_queue:
+                            self.message_queue[sk] = [m for m in self.message_queue[sk] if m['id'] != mid]
+                            if not self.message_queue[sk]: del self.message_queue[sk]
+
                         if sk in self.chat_histories:
                             for m in reversed(self.chat_histories[sk]):
                                 if m['id'] == mid: m['status'] = 'ack'; break
@@ -513,13 +556,6 @@ class ChatClient:
     # Función que nos permite conectarnos a un usuario que no tenemos en nuestra lsita de contactos.
     def connect_manual(self, ip, port, name="Unknown"):
         sk = f"{ip}:{port}"
-        
-        # Corrección: Si el nombre se ha perdido (es Unknown o RECONNECT), intentar recuperarlo de los peers
-        if name in ["Unknown", "RECONNECT"]:
-            for p in self.peers.values():
-                if p['ip'] == ip and p['port'] == port:
-                    name = p['name']; break
-
         if sk in self.sessions:
             real = self.verified_users.get(sk, name)
             if sk in self.offline_peers: self.offline_peers.remove(sk)
@@ -529,14 +565,14 @@ class ChatClient:
 
         STATE.clear_messages()
         STATE.add_message("SYS", f"--> INICIANDO HANDSHAKE: {name}...", True)
-        s = SessionCrypto()
+        s = SessionCrypto() # FIX: Sin args
         self.sessions[sk] = s
         mk = s.get_public_bytes()
         self.handshake_cooldowns[sk] = time.time()
         for _ in range(3): self.protocol.send_packet(ip, port, MSG_HELLO, 0, mk)
         STATE.target_info = (ip, port)
         STATE.target_name = name
-        STATE.set_status(f"LLAMANDO A {name}...")
+        STATE.set_status(f"LLAMANDO A {name}...")
 
 
     # Función que nos permite devolver el handshake que alguien ha iniciado con nosotros.
@@ -548,7 +584,7 @@ class ChatClient:
         
         STATE.clear_messages()
         STATE.add_message("SYS", "ESTABLECIENDO CIFRADO...", True)
-        s = SessionCrypto()
+        s = SessionCrypto() # FIX: Sin args
         self.sessions[sk] = s
         s.compute_secret(self.pending_requests[sk])
         mk = s.get_public_bytes()
@@ -583,7 +619,8 @@ class ChatClient:
             
                 STATE.add_message(self.name, text, True, mid=mid, status='queued')
                 self.save_msg_to_history(sk, msg_data)
-                
+                # Aseguramos guardado en disco
+                self.save_sessions_securely()
                 return
 
             # Si está ONLINE, lo enviamos.
@@ -640,8 +677,14 @@ class CodecDisplay:
         screen.fill(COLOR_FONDO)
         screen.blit(self.bg_frames[self.frame_idx], (0, 20))
         screen.blit(font_ui.render(STATE.status_msg, True, COLOR_TEXTO), (20, 5))
-        self._draw_face(screen, STATE.my_name, 675, 30)
-        if STATE.target_name: self._draw_face(screen, STATE.target_name, 130, 30)
+        
+        # CORREGIDO: LIMPIAR NOMBRE PARA EL GIF
+        my_clean = STATE.my_name.split(" [")[0].strip().lower()
+        self._draw_face(screen, my_clean, 675, 30)
+        
+        if STATE.target_name: 
+            tg_clean = STATE.target_name.split(" [")[0].strip().lower()
+            self._draw_face(screen, tg_clean, 130, 30)
 
         h_chat = 360; y_base = 238
         sidebar = pygame.Rect(30, y_base, 200, h_chat)
@@ -683,11 +726,11 @@ class CodecDisplay:
                 h = (len(lines) * 20) + 30 
                 
                 # ICONOS DE ESTADO
-                st = m['status']
-                tick = "o" if st=='queued' else ("√" if st=='sent' else "√√")
-                if not m['is_me']: tick = ""
-                
-                tm = m['time'] + (f" [{tick}]" if tick else "")
+                if m['is_me']:
+                    st = m['status']
+                    tick = "o" if st=='queued' else ("√" if st=='sent' else "√√")
+                    tm = f"{m['time']} [{tick}]"
+                else: tm = m['time']
                 
                 last_w = font.size(lines[-1])[0] if lines else 0
                 if last_w + font.size(tm)[0] + 40 > chat_disp.width - 120:
@@ -723,16 +766,17 @@ class CodecDisplay:
 
                 full = m['text']
                 
-                st = m['status']
-                tick = "o" if st=='queued' else ("√" if st=='sent' else "√√")
-                if not m['is_me']: tick = ""
-                tm = m['time'] + (f" [{tick}]" if tick else "")
+                if m['is_me']:
+                    st = m['status']
+                    tick = "o" if st=='queued' else ("√" if st=='sent' else "√√")
+                    tm = f"{m['time']} [{tick}]"
+                else: tm = m['time']
 
                 lines = wrap_text(full, font, chat_disp.width - 120)
                 
                 txt_w = max([font.size(l)[0] for l in lines] + [10])
                 tm_w = font.size(tm)[0]
-                w_bub = max(txt_w, tm_w) + 30 
+                w_bub = max(txt_w, tm_w) + 40 
 
                 if align == "right": x_bub = chat_disp.right - w_bub - 15
                 elif align == "left": x_bub = chat_disp.left + 15
@@ -764,9 +808,14 @@ class CodecDisplay:
 
     # Función para dibujar las caras de los personajes.
     def _draw_face(self, screen, name, x, y):
-        clean_name = name.split(" [")[0].strip().lower()
+        # 1. Limpiamos el nombre para buscar el archivo (quitamos [OK] y pasamos a minúsculas)
+        clean_name = name.split(" [")[0].lower().strip()
+        
+        # 2. Obtenemos los frames usando la lógica corregida de arriba
         frames = CHARS.get(clean_name)
-        is_talking = STATE.is_talking(name)
+        
+        # 3. Comprobamos si está hablando usando el nombre LIMPIO
+        is_talking = STATE.is_talking(clean_name)
 
         idx = (pygame.time.get_ticks()//100) % len(frames) if is_talking else 0
         screen.blit(frames[idx], (x, y))
