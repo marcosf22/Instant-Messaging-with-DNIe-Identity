@@ -290,21 +290,35 @@ class ChatClient:
                 if ip == self.my_ip and port == self.port: return
 
                 k = f"{ip}:{port}"
+                
+                # Determinar el nombre real a mostrar (Verificado > Discovery)
+                real_display_name = self.verified_users.get(k, clean)
 
-                # Si estaba OFFLINE, lo pasamos a ONLINE.
+                # 1. GESTIÓN DE RECONEXIÓN (OFFLINE -> ONLINE)
                 if k in self.offline_peers: 
                     self.offline_peers.remove(k)
-                    if STATE.target_info == (ip, port):
-                        STATE.set_status(f"CONECTADO: {self.verified_users.get(k, clean)}")
                     
-                    self.flush_queue(ip, port)
+                    # Si estamos hablando con él en este momento
+                    if STATE.target_info == (ip, port):
+                        # ACTUALIZAMOS EL ESTADO
+                        STATE.set_status(f"CONECTADO: {real_display_name}")
+                        
+                        # --- ARREGLO FOTO/GIF ---
+                        # Forzamos la actualización del nombre objetivo para que el render
+                        # sepa qué cara pintar inmediatamente.
+                        STATE.target_name = real_display_name 
+                        # ------------------------
+                        
+                        STATE.add_message("SYS", f"ℹ️ {clean} ha vuelto ONLINE.", True)
+                    
+                    # Vaciar cola si había mensajes pendientes
+                    if k in self.sessions: self.flush_queue(ip, port)
 
+                # 2. GESTIÓN DE NUEVOS USUARIOS
                 exists = False
                 for p in self.peers.values():
                     if p['ip'] == ip and p['port'] == port: exists = True
                 
-
-                # Si no lo teníamos guardado, lo guardamos.
                 if not exists:
                     pid = self.peer_counter
                     self.peers[pid] = {'ip': ip, 'port': port, 'name': clean}
@@ -312,8 +326,13 @@ class ChatClient:
                     STATE.peers = self.peers.copy()
                     if k not in self.sessions:
                         STATE.sound_queue.append("contact")
+                        STATE.add_message("SYS", f"RADAR: {clean}", True)
+                    else: 
+                        # Si es nuevo en la lista visual pero ya teníamos sesión, 
+                        # intentamos vaciar cola por si acaso
+                        self.flush_queue(ip, port)
 
-                # Si ya lo teníamos guardado, hacemos un saludo pero sin todo el handshake.
+                # 3. AUTO-RECONNECT
                 if k in self.sessions:
                     self.perform_background_reconnect(ip, port)
             except: pass
