@@ -84,6 +84,7 @@ class CodecCharacterLoader:
     def __init__(self):
         self.chars = {}; self.keys = []
         self.load()
+        
     def load(self):
         f = resource_path(os.path.join("assets", "characters"))
         if not os.path.exists(f): os.makedirs(f, exist_ok=True)
@@ -92,21 +93,14 @@ class CodecCharacterLoader:
         self.chars['default'] = [s]
         for file in os.listdir(f):
             if file.endswith('.gif'):
-                # Corrección: f ya es una ruta absoluta procesada por resource_path, no la envolvemos de nuevo
-                frames = load_gif_frames(os.path.join(f, file), (150,200))
+                frames = load_gif_frames(resource_path(os.path.join(f, file)), (150,200))
                 if frames: self.chars[file.split('.')[0].lower()] = frames
         self.keys = sorted(list(self.chars.keys()))
 
     def get(self, uid):
-        # 1. Búsqueda Directa: ¿Tenemos un gif con este nombre?
         if uid in self.chars: return self.chars[uid]
-        
-        # 1.1 Intento extra: Reemplazar espacios por guiones bajos (ej: "big boss" -> "big_boss")
         uid_us = uid.replace(" ", "_")
         if uid_us in self.chars: return self.chars[uid_us]
-
-        # 2. Fallback: Si no existe el gif específico, usa el hash 
-        # para asignar uno aleatorio pero consistente (para que no salga vacío).
         if not self.keys: return self.chars['default']
         return self.chars[self.keys[zlib.crc32(str(uid).encode()) % len(self.keys)]]
 
@@ -137,8 +131,9 @@ class AppState:
         
         if not is_sys:
             clean_snd = snd.split(" [")[0].lower()
-            # Guardamos el nombre original para el timer
-            self.talking_timer[snd] = pygame.time.get_ticks() + 2500
+            
+            self.talking_timer[clean_snd] = pygame.time.get_ticks() + 2500
+            
             if not is_me: self.sound_queue.append("msg")
         return msg_obj
 
@@ -541,7 +536,7 @@ class ChatClient:
         for _ in range(3): self.protocol.send_packet(ip, port, MSG_HELLO, 0, mk)
         STATE.target_info = (ip, port)
         STATE.target_name = name
-        STATE.set_status(f"LLAMANDO A {name}...")
+        STATE.set_status(f"LLAMANDO A {name}...")
 
 
     # Función que nos permite devolver el handshake que alguien ha iniciado con nosotros.
@@ -589,7 +584,6 @@ class ChatClient:
                 STATE.add_message(self.name, text, True, mid=mid, status='queued')
                 self.save_msg_to_history(sk, msg_data)
                 
-                STATE.add_message("SYS", "En cola (Usuario Offline).", True)
                 return
 
             # Si está ONLINE, lo enviamos.
@@ -752,7 +746,7 @@ class CodecDisplay:
                     screen.blit(font.render(l, True, col), (r_bub.x+10, ty)); ty += 20
                 
                 t_surf = font.render(tm, True, TXT_TIME)
-                screen.blit(t_surf, (r_bub.right - t_surf.get_width()-8, r_bub.bottom-8))
+                screen.blit(t_surf, (r_bub.right - t_surf.get_width()-15, r_bub.bottom-17))
 
             current_y -= (h_bub + 10)
 
@@ -770,14 +764,8 @@ class CodecDisplay:
 
     # Función para dibujar las caras de los personajes.
     def _draw_face(self, screen, name, x, y):
-        # 1. Limpiamos el nombre para buscar el archivo (quitamos [OK] y pasamos a minúsculas)
-        # Corrección: Añadido .strip() para evitar errores con espacios extra
         clean_name = name.split(" [")[0].strip().lower()
-        
         frames = CHARS.get(clean_name)
-        
-        # 3. Comprobamos si está hablando usando el nombre ORIGINAL (con mayúsculas y todo)
-        # porque así es como se guarda en el temporizador de STATE.
         is_talking = STATE.is_talking(name)
 
         idx = (pygame.time.get_ticks()//100) % len(frames) if is_talking else 0
