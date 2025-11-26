@@ -8,6 +8,7 @@ from crypto import KeyManager, SessionCrypto
 from protocol import ChatProtocol, MSG_HELLO, MSG_DATA, MSG_AUTH, MSG_ACK, MSG_BYE
 from discovery import DiscoveryManager
 
+
 # Configuración interfaz.
 ANCHO, ALTO = 950, 650 
 COLOR_FONDO = (10, 15, 10) 
@@ -34,6 +35,17 @@ SESSION_FILE = "sessions.json"
 
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+
+# Esta función es para convertirlo en un ejecutable.
+def resource_path(relative_path):
+    try:
+        # PyInstaller crea una carpeta temporal en _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
 
 
 # Funciones de la interfaz. El código más "técnico" está a partir de la línea 145 :)
@@ -73,17 +85,28 @@ class CodecCharacterLoader:
         self.chars = {}; self.keys = []
         self.load()
     def load(self):
-        f = os.path.join("assets", "characters")
+        f = resource_path(os.path.join("assets", "characters"))
         if not os.path.exists(f): os.makedirs(f, exist_ok=True)
         s = pygame.Surface((150, 200)); s.fill((0,20,0))
         pygame.draw.rect(s, COLOR_MARCO, (0,0,150,200), 2)
         self.chars['default'] = [s]
         for file in os.listdir(f):
             if file.endswith('.gif'):
+                # Corrección: f ya es una ruta absoluta procesada por resource_path, no la envolvemos de nuevo
                 frames = load_gif_frames(os.path.join(f, file), (150,200))
                 if frames: self.chars[file.split('.')[0].lower()] = frames
         self.keys = sorted(list(self.chars.keys()))
+
     def get(self, uid):
+        # 1. Búsqueda Directa: ¿Tenemos un gif con este nombre?
+        if uid in self.chars: return self.chars[uid]
+        
+        # 1.1 Intento extra: Reemplazar espacios por guiones bajos (ej: "big boss" -> "big_boss")
+        uid_us = uid.replace(" ", "_")
+        if uid_us in self.chars: return self.chars[uid_us]
+
+        # 2. Fallback: Si no existe el gif específico, usa el hash 
+        # para asignar uno aleatorio pero consistente (para que no salga vacío).
         if not self.keys: return self.chars['default']
         return self.chars[self.keys[zlib.crc32(str(uid).encode()) % len(self.keys)]]
 
@@ -104,22 +127,26 @@ class AppState:
     
 
     # Añadimos los mensajes para mostrarlos por pantalla.
-    def add_message(self, snd, txt, is_me=False, is_sys=False, mid=None, time_str=None, status='sent'):
+    def add_message(self, snd, txt, is_me=False, is_sys=False, mid=None, time_str=None, status='queued'):
         if not time_str: time_str = datetime.now().strftime("%H:%M")
         msg_obj = {
             'id': mid, 'sender': snd, 'text': txt, 
             'is_me': is_me, 'is_sys': is_sys, 'time': time_str, 'status': status
         }
         self.messages.append(msg_obj)
+        
         if not is_sys:
+            clean_snd = snd.split(" [")[0].lower()
+            # Guardamos el nombre original para el timer
             self.talking_timer[snd] = pygame.time.get_ticks() + 2500
             if not is_me: self.sound_queue.append("msg")
-        return msg_obj 
+        return msg_obj
 
 
     # Función que usamos cuando queremos limpiar la pantalla y vaciar la lista de mensajes.
     def clear_messages(self):
         self.messages = []
+        self.talking_timer = {}
 
 
     # Función que marca el ACK a un mensaje.
@@ -210,7 +237,6 @@ class ChatClient:
         if sk in self.message_queue and self.message_queue[sk]:
             pending = self.message_queue[sk]
             count = len(pending)
-            STATE.add_message("SYS", f"Enviando {count} mensajes en cola...", True)
 
             still_pending = []
             for msg_data in pending:
@@ -249,7 +275,6 @@ class ChatClient:
                     self.offline_peers.remove(k)
                     if STATE.target_info == (ip, port):
                         STATE.set_status(f"CONECTADO: {self.verified_users.get(k, clean)}")
-                        STATE.add_message("SYS", f"{clean} ha vuelto ONLINE.", True)
                     
                     self.flush_queue(ip, port)
 
@@ -266,7 +291,6 @@ class ChatClient:
                     STATE.peers = self.peers.copy()
                     if k not in self.sessions:
                         STATE.sound_queue.append("contact")
-                        STATE.add_message("SYS", f"RADAR: {clean}", True)
 
 
                 # Si ya lo teníamos guardado, hacemos un saludo pero sin todo el handshake.
@@ -356,7 +380,6 @@ class ChatClient:
     # Esta función muestra el mensaje por pantalla de que estamos realizando la verificación..
     def send_verification(self):
         if not STATE.target_info: return STATE.add_message("SYS", "Conecta primero.", True)
-        STATE.add_message("SYS", "Firmando...", True)
         threading.Thread(target=self._firmar_y_enviar, daemon=True).start()
 
 
@@ -495,6 +518,13 @@ class ChatClient:
     # Función que nos permite conectarnos a un usuario que no tenemos en nuestra lsita de contactos.
     def connect_manual(self, ip, port, name="Unknown"):
         sk = f"{ip}:{port}"
+        
+        # Corrección: Si el nombre se ha perdido (es Unknown o RECONNECT), intentar recuperarlo de los peers
+        if name in ["Unknown", "RECONNECT"]:
+            for p in self.peers.values():
+                if p['ip'] == ip and p['port'] == port:
+                    name = p['name']; break
+
         if sk in self.sessions:
             real = self.verified_users.get(sk, name)
             if sk in self.offline_peers: self.offline_peers.remove(sk)
@@ -586,14 +616,14 @@ class ChatClient:
 # Clase que estructura toda la interfaz.
 class CodecDisplay:
     def __init__(self, size):
-        self.bg_frames = load_gif_frames("assets/codec_background.gif", (ANCHO, 350))
+        self.bg_frames = load_gif_frames(resource_path("assets/codec_background.gif"), (ANCHO, 350))
         if not self.bg_frames: self.bg_frames=[pygame.Surface((ANCHO, 350))]
         self.frame_idx = 0
         self.active_buttons = []
         self.scroll_y = 0 
         try: pygame.mixer.init(); self.snd = {
-            "call": pygame.mixer.Sound("assets/call.mp3"), "msg": pygame.mixer.Sound("assets/call.mp3"),
-            "contact": pygame.mixer.Sound("assets/call.mp3"), "open": pygame.mixer.Sound("assets/open.mp3")
+            "call": pygame.mixer.Sound(resource_path("assets/call.mp3")), "msg": pygame.mixer.Sound(resource_path("assets/mensaje.mp3")),
+            "contact": pygame.mixer.Sound(resource_path("assets/call.mp3")), "open": pygame.mixer.Sound(resource_path("assets/call.mp3"))
         }
         except: self.snd = {}
 
@@ -740,9 +770,17 @@ class CodecDisplay:
 
     # Función para dibujar las caras de los personajes.
     def _draw_face(self, screen, name, x, y):
-        clean_name = name.split(" [")[0].lower()
+        # 1. Limpiamos el nombre para buscar el archivo (quitamos [OK] y pasamos a minúsculas)
+        # Corrección: Añadido .strip() para evitar errores con espacios extra
+        clean_name = name.split(" [")[0].strip().lower()
+        
         frames = CHARS.get(clean_name)
-        idx = (pygame.time.get_ticks()//100) % len(frames) if STATE.is_talking(clean_name) else 0
+        
+        # 3. Comprobamos si está hablando usando el nombre ORIGINAL (con mayúsculas y todo)
+        # porque así es como se guarda en el temporizador de STATE.
+        is_talking = STATE.is_talking(name)
+
+        idx = (pygame.time.get_ticks()//100) % len(frames) if is_talking else 0
         screen.blit(frames[idx], (x, y))
 
 
