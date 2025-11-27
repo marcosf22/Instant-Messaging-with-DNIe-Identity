@@ -74,3 +74,11 @@ pip install pygame zeroconf cryptography python-pyscard pykcs11 pillow
 ---
 
 ## 🎮 Guía de Uso
+
+El programa ofrece una barra lateral donde se encuentran los contactos guardados del usuario, así como otros usuarios detectados en la red a los que podemos añadir.
+Tocando sobre su nombre, se realiza la conexión y accedemos al chat.
+Para salir de los chats, se implementa el comando /leave, con el que el programa queda a la espera de que selecciones un chat para entrar.
+Aquellos contactos que estén OFFLINE, se marcan con un color gris.
+El resto de contactos, se muestran de color azul, indicando que se ha verificado su identidad mostrando su nombre real en la parte superior.
+Por último, los contactos a los que no hemos añadido aún, pero aparecen disponibles para añadir, salen de color verde oscuro.
+Si un usuario ha iniciado un handshake contigo, se notifica mediante una alerta, así como también cambia el color de su nombre a naranja.
