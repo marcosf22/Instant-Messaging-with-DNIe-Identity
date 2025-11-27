@@ -82,7 +82,7 @@ pip install pygame zeroconf cryptography python-pyscard pykcs11 pillow
 * El resto de contactos, se muestran de color azul, indicando que se ha verificado su identidad mostrando su nombre real en la parte superior.
 * Los contactos a los que no hemos añadido aún, pero aparecen disponibles para añadir, salen de color verde oscuro.
 * Por último, si un usuario ha iniciado un handshake contigo, se notifica mediante una alerta, así como también cambia el color de su nombre a naranja.
-* 
-<p align="left">
-  <img src="./images/pantalla.png" alt="Captura de pantalla 1" width="200"/>
+  
+<p align="center">
+  <img src="./images/pantalla.png" alt="Captura de pantalla 1" width="500"/>
 </p>
