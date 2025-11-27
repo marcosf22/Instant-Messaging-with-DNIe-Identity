@@ -326,6 +326,9 @@ class ChatClient:
             s = self.sessions[sess_key]
             mk = s.get_public_bytes()
             self.protocol.send_packet(ip, port, MSG_HELLO, 0, mk)
+            
+            # Verificación automática al reconectar (Iniciador)
+            self.send_verification(ip, port)
         except: pass
 
 
@@ -344,7 +347,7 @@ class ChatClient:
             c = 0
             for sk, entry in data.items():
                 hex_key = entry if isinstance(entry, str) else entry.get('key')
-                s = SessionCrypto() # FIX: Sin args
+                s = SessionCrypto()
                 try: 
                     s.load_secret(hex_key)
                     self.sessions[sk] = s
@@ -355,7 +358,31 @@ class ChatClient:
 
                         vname = entry.get('verified_name')
                         self.verified_users[sk] = vname if vname else ""
+                    
+                    # === CARGA DE CONTACTOS OFFLINE ===
+                    try:
+                        parts = sk.split(':')
+                        ip_sess = parts[0]
+                        port_sess = int(parts[1])
+                        
+                        exists = False
+                        for p in self.peers.values():
+                            if p['ip'] == ip_sess and p['port'] == port_sess: exists = True
+                        
+                        if not exists:
+                            pid = self.peer_counter
+                            d_name = self.verified_users.get(sk, "Unknown")
+                            if "[OK]" in d_name: d_name = d_name.replace(" [OK]", "")
+                            
+                            self.peers[pid] = {'ip': ip_sess, 'port': port_sess, 'name': d_name}
+                            self.peer_counter += 1
+                            self.offline_peers.add(sk)
+                    except: pass
+                    # ==================================
+
                 except: pass
+            
+            STATE.peers = self.peers.copy()
             if c > 0: STATE.add_message("SYS", f"{c} chats recuperados.", True)
         except: pass
 
@@ -407,15 +434,25 @@ class ChatClient:
 
 
     # Esta función muestra el mensaje por pantalla de que estamos realizando la verificación..
-    def send_verification(self):
-        if not STATE.target_info: return STATE.add_message("SYS", "Conecta primero.", True)
-        threading.Thread(target=self._firmar_y_enviar, daemon=True).start()
+    def send_verification(self, target_ip=None, target_port=None):
+        if not target_ip and not STATE.target_info: 
+            return STATE.add_message("SYS", "Conecta primero.", True)
+        
+        threading.Thread(target=self._firmar_y_enviar, args=(target_ip, target_port), daemon=True).start()
 
 
     # Esta función permite al otro extremo verificar nuestra identidad.
-    def _firmar_y_enviar(self):
+    def _firmar_y_enviar(self, target_ip=None, target_port=None):
         try:
-            key_sess = f"{STATE.target_info[0]}:{STATE.target_info[1]}"
+            if target_ip and target_port:
+                ip, port = target_ip, target_port
+            elif STATE.target_info:
+                ip, port = STATE.target_info
+            else: return
+
+            key_sess = f"{ip}:{port}"
+            if key_sess not in self.sessions: return
+
             clave_pub = self.sessions[key_sess].get_public_bytes()
             cert, firma = self.key_manager.firmar_handshake(clave_pub)
             if not cert: return
@@ -423,7 +460,7 @@ class ChatClient:
                       struct.pack("!I", len(firma)) + firma + \
                       clave_pub
             enc = self.sessions[key_sess].encrypt(payload.decode('latin1'))
-            ip, port = STATE.target_info
+            
             self.loop.call_soon_threadsafe(self.protocol.send_packet, ip, port, MSG_AUTH, 0, enc)
 
         except Exception as e: STATE.add_message("SYS", f"Error DNIe: {e}", True)
@@ -451,6 +488,10 @@ class ChatClient:
                         mk = self.sessions[sk].get_public_bytes()
                         self.protocol.send_packet(ip, port, MSG_HELLO, 0, mk)
                         self.handshake_cooldowns[sk] = now
+                        
+                        # Envíamos la verificación automáticamente.
+                        self.send_verification(ip, port)
+
                 except: pass
                 return
 
@@ -539,7 +580,6 @@ class ChatClient:
                     v, cn = self.key_manager.verificar_handshake(pk, cert, sig)
                     if v:
                         STATE.sound_queue.append("open")
-                        STATE.add_message("SYS", f">> DNIe VERIFICADO: {cn}", True)
                         self.verified_users[sk] = f"{cn} [OK]"
                         self.save_sessions_securely()
                         if STATE.target_info == (ip, port):
@@ -549,7 +589,7 @@ class ChatClient:
                 except: pass
 
 
-    # Función que nos permite conectarnos a un usuario que no tenemos en nuestra lsita de contactos.
+    # Función que nos permite conectarnos a un usuario que no tenemos en nuestra lista de contactos.
     def connect_manual(self, ip, port, name="Unknown"):
         sk = f"{ip}:{port}"
         if sk in self.sessions:
@@ -569,6 +609,9 @@ class ChatClient:
         STATE.target_info = (ip, port)
         STATE.target_name = name
         STATE.set_status(f"LLAMANDO A {name}...")
+        
+        # Mnadamos la verificación manualmente para que el iniciador también se verifique.
+        self.send_verification(ip, port)
 
 
     # Función que nos permite devolver el handshake que alguien ha iniciado con nosotros.
@@ -592,6 +635,9 @@ class ChatClient:
         self.switch_chat_view(ip, port, name)
         self.save_sessions_securely()
         STATE.add_message(self.name, f">> CANAL SEGURO ESTABLECIDO.", True)
+        
+        # Verificación automática al aceptar llamada.
+        self.send_verification(ip, port)
 
 
     # Función para enviar mensajes.
