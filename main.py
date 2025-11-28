@@ -40,7 +40,6 @@ if sys.platform == 'win32':
 # Esta función es para convertirlo en un ejecutable.
 def resource_path(relative_path):
     try:
-        # PyInstaller crea una carpeta temporal en _MEIPASS
         base_path = sys._MEIPASS
     except Exception:
         base_path = os.path.abspath(".")
@@ -220,7 +219,12 @@ class ChatClient:
             STATE.messages.extend(self.chat_histories[sk])
         STATE.target_info = (ip, port)
         STATE.target_name = name
-        STATE.set_status(f"CONECTADO: {name}")
+        
+        # Muestra el estado correcto incluso si es offline
+        if sk in self.offline_peers:
+            STATE.set_status(f"OFFLINE: {name}")
+        else:
+            STATE.set_status(f"CONECTADO: {name}")
 
 
     # Almacenamos los mensajes en el JSON cifrado.
@@ -307,16 +311,50 @@ class ChatClient:
                     pid = self.peer_counter
                     self.peers[pid] = {'ip': ip, 'port': port, 'name': clean}
                     self.peer_counter += 1
-                    STATE.peers = self.peers.copy()
+                    
                     if k not in self.sessions:
                         STATE.sound_queue.append("contact")
                     else: 
                         self.flush_queue(ip, port)
+                
+                # Actualizar lista combinada
+                self.refresh_peers_list()
 
                 # Auto-reconexión.
                 if k in self.sessions:
                     self.perform_background_reconnect(ip, port)
             except: pass
+        
+        elif action == "REMOVE":
+            # Si se va, actualizamos para que salga como offline (si estaba guardado)
+            self.refresh_peers_list()
+
+
+    # Combina los contactos online (Discovery) con los guardados (Offline) para la barra lateral.
+    def refresh_peers_list(self):
+        combined = self.peers.copy()
+        
+        # ID inicial ficticio para offline
+        fake_id = 50000 
+
+        for sk in self.sessions:
+            try:
+                ip, port_str = sk.split(':')
+                port = int(port_str)
+                
+                # Si ya está en la lista de peers online, lo saltamos
+                is_online = False
+                for p in combined.values():
+                    if p['ip'] == ip and p['port'] == port:
+                        is_online = True; break
+                
+                if not is_online:
+                    name = self.verified_users.get(sk, f"User {port}")
+                    combined[fake_id] = {'ip': ip, 'port': port, 'name': name}
+                    fake_id += 1
+            except: pass
+        
+        STATE.peers = combined
 
 
     # Saludo que hacemos cuando reconectamos con un contacto existente para no hacer el handshake otra vez.
@@ -326,8 +364,7 @@ class ChatClient:
             s = self.sessions[sess_key]
             mk = s.get_public_bytes()
             self.protocol.send_packet(ip, port, MSG_HELLO, 0, mk)
-            
-            # Verificación automática al reconectar (Iniciador)
+
             self.send_verification(ip, port)
         except: pass
 
@@ -347,43 +384,25 @@ class ChatClient:
             c = 0
             for sk, entry in data.items():
                 hex_key = entry if isinstance(entry, str) else entry.get('key')
-                s = SessionCrypto()
+                s = SessionCrypto() 
                 try: 
                     s.load_secret(hex_key)
                     self.sessions[sk] = s
                     c += 1
+                    # Marcamos offline por defecto al cargar
+                    self.offline_peers.add(sk)
+
                     if isinstance(entry, dict):
                         self.chat_histories[sk] = entry.get('history', [])
                         if 'queue' in entry: self.message_queue[sk] = entry['queue']
 
                         vname = entry.get('verified_name')
                         self.verified_users[sk] = vname if vname else ""
-                    
-                    # === CARGA DE CONTACTOS OFFLINE ===
-                    try:
-                        parts = sk.split(':')
-                        ip_sess = parts[0]
-                        port_sess = int(parts[1])
-                        
-                        exists = False
-                        for p in self.peers.values():
-                            if p['ip'] == ip_sess and p['port'] == port_sess: exists = True
-                        
-                        if not exists:
-                            pid = self.peer_counter
-                            d_name = self.verified_users.get(sk, "Unknown")
-                            if "[OK]" in d_name: d_name = d_name.replace(" [OK]", "")
-                            
-                            self.peers[pid] = {'ip': ip_sess, 'port': port_sess, 'name': d_name}
-                            self.peer_counter += 1
-                            self.offline_peers.add(sk)
-                    except: pass
-                    # ==================================
-
                 except: pass
             
-            STATE.peers = self.peers.copy()
-            if c > 0: STATE.add_message("SYS", f"{c} chats recuperados.", True)
+            if c > 0: 
+                STATE.add_message("SYS", f"{c} chats recuperados.", True)
+                self.refresh_peers_list()
         except: pass
 
 
@@ -433,23 +452,23 @@ class ChatClient:
         await self.discovery.stop()
 
 
-    # Esta función muestra el mensaje por pantalla de que estamos realizando la verificación..
-    def send_verification(self, target_ip=None, target_port=None):
-        if not target_ip and not STATE.target_info: 
-            return STATE.add_message("SYS", "Conecta primero.", True)
+    # Esta función envía un mensaje de verificación de identidad.
+    def send_verification(self, ip=None, port=None):
+        target_ip, target_port = ip, port
+        
+        if not target_ip:
+             if STATE.target_info: 
+                 target_ip, target_port = STATE.target_info
+             else: 
+                 return STATE.add_message("SYS", "Conecta primero.", True)
         
         threading.Thread(target=self._firmar_y_enviar, args=(target_ip, target_port), daemon=True).start()
 
 
     # Esta función permite al otro extremo verificar nuestra identidad.
-    def _firmar_y_enviar(self, target_ip=None, target_port=None):
+    def _firmar_y_enviar(self, ip, port):
+        # time.sleep(1.5)
         try:
-            if target_ip and target_port:
-                ip, port = target_ip, target_port
-            elif STATE.target_info:
-                ip, port = STATE.target_info
-            else: return
-
             key_sess = f"{ip}:{port}"
             if key_sess not in self.sessions: return
 
@@ -459,11 +478,12 @@ class ChatClient:
             payload = struct.pack("!I", len(cert)) + cert + \
                       struct.pack("!I", len(firma)) + firma + \
                       clave_pub
-            enc = self.sessions[key_sess].encrypt(payload.decode('latin1'))
             
+            enc = self.sessions[key_sess].encrypt(payload.decode('latin1'))
             self.loop.call_soon_threadsafe(self.protocol.send_packet, ip, port, MSG_AUTH, 0, enc)
 
-        except Exception as e: STATE.add_message("SYS", f"Error DNIe: {e}", True)
+        except Exception as e: 
+            STATE.add_message("SYS", f"Error DNIe: {e}", True)
 
 
     # Esta función es la clave xd.
@@ -482,16 +502,15 @@ class ChatClient:
                     self.save_sessions_securely()
                     self.flush_queue(ip, port)
                     
+                    # Acabamos de recibir el HELLO (respuesta), enviamos nuestra identidad.
+                    self.send_verification(ip, port)
+
                     last_time = self.handshake_cooldowns.get(sk, 0)
                     now = time.time()
                     if now - last_time > 5:
                         mk = self.sessions[sk].get_public_bytes()
                         self.protocol.send_packet(ip, port, MSG_HELLO, 0, mk)
                         self.handshake_cooldowns[sk] = now
-                        
-                        # Envíamos la verificación automáticamente.
-                        self.send_verification(ip, port)
-
                 except: pass
                 return
 
@@ -564,6 +583,7 @@ class ChatClient:
         elif pkt.msg_type == MSG_BYE:
             if sk not in self.offline_peers:
                 self.offline_peers.add(sk)
+                self.refresh_peers_list() # Refresca lista para mostrarlo offline
                 if STATE.target_info == (ip, port):
                     STATE.set_status(f"OFFLINE: {STATE.target_name}")
 
@@ -580,8 +600,12 @@ class ChatClient:
                     v, cn = self.key_manager.verificar_handshake(pk, cert, sig)
                     if v:
                         STATE.sound_queue.append("open")
+                        STATE.add_message("SYS", f">> DNIe VERIFICADO: {cn}", True)
                         self.verified_users[sk] = f"{cn} [OK]"
                         self.save_sessions_securely()
+                        
+                        self.refresh_peers_list() # Actualizar nombre con [OK]
+
                         if STATE.target_info == (ip, port):
                             STATE.target_name = self.verified_users[sk]
                             STATE.set_status(f"CONECTADO: {STATE.target_name}")
@@ -589,7 +613,7 @@ class ChatClient:
                 except: pass
 
 
-    # Función que nos permite conectarnos a un usuario que no tenemos en nuestra lista de contactos.
+    # Función que nos permite conectarnos a un usuario que no tenemos en nuestra lsita de contactos.
     def connect_manual(self, ip, port, name="Unknown"):
         sk = f"{ip}:{port}"
         if sk in self.sessions:
@@ -609,16 +633,20 @@ class ChatClient:
         STATE.target_info = (ip, port)
         STATE.target_name = name
         STATE.set_status(f"LLAMANDO A {name}...")
-        
-        # Mnadamos la verificación manualmente para que el iniciador también se verifique.
-        self.send_verification(ip, port)
 
 
     # Función que nos permite devolver el handshake que alguien ha iniciado con nosotros.
     def accept_connection(self, pid):
-        if pid not in self.peers: return
-        ip = self.peers[pid]['ip']; port = self.peers[pid]['port']; name = self.peers[pid]['name']
+        if pid not in STATE.peers: return
+        t = STATE.peers[pid]
+        ip, port, name = t['ip'], t['port'], t['name']
         sk = f"{ip}:{port}"
+
+        # Si ya teníamos sesión (offline clickeado), conectamos directo
+        if sk in self.sessions and sk not in self.pending_requests:
+            self.connect_manual(ip, port, name)
+            return
+
         if sk not in self.pending_requests: return
         
         STATE.clear_messages()
@@ -634,10 +662,11 @@ class ChatClient:
         
         self.switch_chat_view(ip, port, name)
         self.save_sessions_securely()
-        STATE.add_message(self.name, f">> CANAL SEGURO ESTABLECIDO.", True)
         
-        # Verificación automática al aceptar llamada.
+        # Acabamos de establecer conexión, enviamos nuestra identidad.
         self.send_verification(ip, port)
+
+        STATE.add_message(self.name, f">> CANAL SEGURO ESTABLECIDO.", True)
 
 
     # Función para enviar mensajes.
@@ -735,7 +764,7 @@ class CodecDisplay:
         y_btn = sidebar.top + 10
         self.active_buttons = []
         
-        # Muestra la lista de usuarios.
+        # Muestra la lista de usuarios (AHORA INCLUYE OFFLINE).
         for pid, d in STATE.peers.items():
             sk = f"{d['ip']}:{d['port']}"
             is_verif = "[OK]" in (client.verified_users.get(sk) or "")
@@ -894,10 +923,12 @@ async def main():
                 if e.button == 1:
                     for r, pid in gui.active_buttons:
                         if r.collidepoint(e.pos):
+                            # Click en un contacto (ONLINE u OFFLINE)
                             if pid in STATE.incoming_ids: client.accept_connection(pid)
                             else: 
-                                t = client.peers[pid]
-                                client.connect_manual(t['ip'], t['port'], t['name'])
+                                if pid in STATE.peers:
+                                    t = STATE.peers[pid]
+                                    client.connect_manual(t['ip'], t['port'], t['name'])
         gui.update(); gui.draw(screen, font, font_ui, client)
         pygame.display.flip(); await asyncio.sleep(0.01)
 
