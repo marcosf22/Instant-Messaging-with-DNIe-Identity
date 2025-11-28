@@ -889,7 +889,7 @@ class CodecDisplay:
 # Main que ejecuta el programa.
 async def main():
     if len(sys.argv) > 1: name = sys.argv[1]
-    else: name = input("Nombre de Agente: ")
+    else: name = input("Introduce tu nombre: ")
     if len(sys.argv) > 2: port = int(sys.argv[2])
     else: 
         try: port = int(input("Puerto (por defecto 8888): "))
